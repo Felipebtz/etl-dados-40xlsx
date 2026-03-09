@@ -22,6 +22,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="Supabase Bulk Uploader", version="2.0.0")
+
+# Sem limite de body size (default Starlette é 100MB)
+# Para Vercel, o limite real é controlado pelo vercel.json
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ──────────────────────────────────────────────────────────────

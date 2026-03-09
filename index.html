@@ -122,13 +122,13 @@
     </p>
   </div>
 
-  <!-- CONFIG -->
+  <!-- CONFIG (hidden) -->
   <div class="z1 w-full max-w-3xl mb-5 p-4 rounded-xl border" style="background:var(--panel);border-color:var(--border)">
     <p class="mono text-xs uppercase tracking-widest mb-3" style="color:var(--muted)">Conexão</p>
     <div class="grid grid-cols-1 gap-3">
       <div>
         <label class="block text-xs mb-1" style="color:var(--muted)">API URL do backend</label>
-        <input id="api-url" type="text" value="http://localhost:8000/upload"
+        <input id="api-url" type="text" value="/upload"
           class="mono w-full text-sm rounded-lg px-3 py-2 border outline-none transition"
           style="background:#0d0d12;border-color:var(--border);color:var(--text)"
           onfocus="this.style.borderColor='#3ecf8e'" onblur="this.style.borderColor='var(--border)'" />
@@ -263,7 +263,7 @@ async function startUpload() {
 
   const form = new FormData();
   for (const f of selectedFiles) form.append('files', f);
-  const url = document.getElementById('api-url').value.trim() || 'http://localhost:8000/upload';
+  const url = document.getElementById('api-url').value.trim() || '/upload';
 
   try {
     setProgress(35);
