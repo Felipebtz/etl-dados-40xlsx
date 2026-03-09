@@ -5,6 +5,7 @@ e insere na tabela correta via conexão direta PostgreSQL (psycopg2 + COPY).
 """
 
 import asyncio
+import gzip
 import io
 import os
 import re
@@ -223,20 +224,27 @@ def process_file(filename: str, content: bytes) -> dict:
     result = {"file": filename, "status": "ok", "rows": 0, "table": "", "elapsed_s": 0, "error": None}
 
     try:
-        # detecta formato pelo nome do arquivo
-        if filename.lower().endswith(".csv"):
-            # tenta separadores comuns automaticamente
+        # descompactar gzip se vier do browser comprimido
+        real_filename = filename
+        raw_content   = content
+        if filename.lower().endswith(".gz"):
+            raw_content   = gzip.decompress(content)
+            real_filename = filename[:-3]  # remove o .gz
+            result["file"] = real_filename  # mostrar nome original no resultado
+
+        # detecta formato pelo nome real do arquivo
+        if real_filename.lower().endswith(".csv"):
             for sep in [",", ";", "\t", "|"]:
                 try:
-                    df = pd.read_csv(io.BytesIO(content), sep=sep, encoding="utf-8", on_bad_lines="skip")
+                    df = pd.read_csv(io.BytesIO(raw_content), sep=sep, encoding="utf-8", on_bad_lines="skip")
                     if len(df.columns) > 1:
                         break
                 except Exception:
                     continue
             else:
-                df = pd.read_csv(io.BytesIO(content), encoding="latin-1", on_bad_lines="skip")
+                df = pd.read_csv(io.BytesIO(raw_content), encoding="latin-1", on_bad_lines="skip")
         else:
-            xls = pd.ExcelFile(io.BytesIO(content))
+            xls = pd.ExcelFile(io.BytesIO(raw_content))
             df = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
         df = df.dropna(how="all")
 
@@ -304,4 +312,4 @@ def frontend():
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 return f.read()
-    return HTMLResponse("<h2>index.html não encontrado</h2>", status_code=404)
+    return HTMLResponse("<h2>index.html não encontrado</h2>", status_code=40

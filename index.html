@@ -128,7 +128,7 @@
     <div class="grid grid-cols-1 gap-3">
       <div>
         <label class="block text-xs mb-1" style="color:var(--muted)">API URL do backend</label>
-        <input id="api-url" type="text" value="/upload"
+        <input id="api-url" type="text" placeholder="deixe vazio para usar este servidor"
           class="mono w-full text-sm rounded-lg px-3 py-2 border outline-none transition"
           style="background:#0d0d12;border-color:var(--border);color:var(--text)"
           onfocus="this.style.borderColor='#3ecf8e'" onblur="this.style.borderColor='var(--border)'" />
@@ -252,35 +252,90 @@ function render() {
   document.getElementById('upload-btn').disabled = selectedFiles.length === 0;
 }
 
-// ── UPLOAD ───────────────────────────────────────────────────
+// ── COMPRESSÃO GZIP (browser nativo via CompressionStream) ──
+async function compressFile(file) {
+  const buffer = await file.arrayBuffer();
+  const stream = new Blob([buffer]).stream();
+  const compressed = stream.pipeThrough(new CompressionStream('gzip'));
+  const chunks = [];
+  const reader = compressed.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  const compressedBlob = new Blob(chunks, { type: 'application/gzip' });
+  // Retorna novo File com .gz no nome para o backend identificar
+  return new File([compressedBlob], file.name + '.gz', { type: 'application/gzip' });
+}
+
+// ── UPLOAD COM COMPRESSÃO ────────────────────────────────────
 async function startUpload() {
   const btn = document.getElementById('upload-btn');
-  btn.disabled = true; btn.textContent = '⏳ Enviando…';
+  btn.disabled = true; btn.textContent = '⏳ Comprimindo…';
 
   const ps = document.getElementById('prog-sec');
   ps.classList.remove('hidden');
-  setProgress(10);
+  setProgress(5);
 
-  const form = new FormData();
-  for (const f of selectedFiles) form.append('files', f);
-  const url = document.getElementById('api-url').value.trim() || '/upload';
+  // 1. Comprimir todos os arquivos em paralelo
+  const label = document.getElementById('prog-label');
+  label.textContent = 'Comprimindo arquivos…';
+  label.classList.add('pulse');
+
+  let compressed;
+  try {
+    compressed = await Promise.all(selectedFiles.map(compressFile));
+  } catch (err) {
+    label.textContent = '✗ Erro ao comprimir: ' + err.message;
+    label.classList.remove('pulse');
+    label.style.color = 'var(--red)';
+    btn.disabled = false; btn.textContent = '⚡ Enviar para Supabase';
+    return;
+  }
+
+  // Mostrar redução de tamanho
+  const originalSize  = selectedFiles.reduce((s, f) => s + f.size, 0);
+  const compressedSize = compressed.reduce((s, f) => s + f.size, 0);
+  const reduction = Math.round((1 - compressedSize / originalSize) * 100);
+  label.textContent = `Enviando… (comprimido ${reduction}% menor)`;
+  setProgress(30);
+
+  // 2. Enviar em lotes de 10 arquivos para não estourar o limite da Vercel
+  const BATCH = 10;
+  const allResults = [];
+  const url = window.location.origin + '/upload';
 
   try {
-    setProgress(35);
-    const res = await fetch(url, { method: 'POST', body: form });
-    setProgress(85);
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-    const data = await res.json();
+    for (let i = 0; i < compressed.length; i += BATCH) {
+      const batch = compressed.slice(i, i + BATCH);
+      const form  = new FormData();
+      for (const f of batch) form.append('files', f);
+
+      label.textContent = `Enviando lote ${Math.floor(i/BATCH)+1} de ${Math.ceil(compressed.length/BATCH)}… (comprimido ${reduction}% menor)`;
+      setProgress(30 + Math.round((i / compressed.length) * 60));
+
+      const res = await fetch(url, { method: 'POST', body: form });
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      const data = await res.json();
+      allResults.push(...data.results);
+    }
+
     setProgress(100);
-    document.getElementById('prog-label').textContent = '✓ Concluído';
-    document.getElementById('prog-label').classList.remove('pulse');
-    document.getElementById('prog-label').style.color = 'var(--accent)';
-    showResults(data);
+    label.textContent = '✓ Concluído';
+    label.classList.remove('pulse');
+    label.style.color = 'var(--accent)';
+
+    const ok  = allResults.filter(r => r.status === 'ok').length;
+    const err = allResults.filter(r => r.status !== 'ok').length;
+    showResults({ total: allResults.length, success: ok, failed: err, results: allResults });
+
   } catch (err) {
-    document.getElementById('prog-label').textContent = '✗ ' + err.message;
-    document.getElementById('prog-label').classList.remove('pulse');
-    document.getElementById('prog-label').style.color = 'var(--red)';
+    label.textContent = '✗ ' + err.message;
+    label.classList.remove('pulse');
+    label.style.color = 'var(--red)';
   }
+
   btn.disabled = false; btn.textContent = '⚡ Enviar para Supabase';
 }
 
