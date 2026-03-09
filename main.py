@@ -16,9 +16,15 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+
+# Encodings e separadores para CSVs (mesmo padrão, origens diferentes)
+CSV_ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1", "iso-8859-1")
+CSV_SEPARATORS = (",", ";", "\t", "|")
+MAX_DB_RETRIES = 3
+RETRY_DELAY_SEC = 1
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Supabase Bulk Uploader", version="2.0.0")
@@ -154,12 +160,57 @@ def sanitize_col(name: str) -> str:
 
 
 def get_conn():
-    return psycopg2.connect(CONFIG["database_url"])
+    """Conexão com retry para falhas transitórias (ex.: Vercel/serverless)."""
+    last_err = None
+    for attempt in range(MAX_DB_RETRIES):
+        try:
+            return psycopg2.connect(CONFIG["database_url"])
+        except Exception as e:
+            last_err = e
+            if attempt < MAX_DB_RETRIES - 1:
+                time.sleep(RETRY_DELAY_SEC * (attempt + 1))
+    raise last_err
 
 
-def ensure_table(conn, table: str, schema_def: list[tuple]):
-    """Cria a tabela se não existir com o schema canônico."""
-    col_defs = ",\n  ".join(f'"{col}" {typ}' for col, typ in schema_def)
+def read_csv_robust(raw_content: bytes) -> pd.DataFrame:
+    """
+    ETL robusto para CSV: tenta vários encodings e separadores.
+    Ideal para vários CSVs com mesmo padrão vindos de fontes diferentes.
+    """
+    for encoding in CSV_ENCODINGS:
+        for sep in CSV_SEPARATORS:
+            try:
+                df = pd.read_csv(
+                    io.BytesIO(raw_content),
+                    sep=sep,
+                    encoding=encoding,
+                    on_bad_lines="skip",
+                    low_memory=False,
+                )
+                if len(df) == 0 or len(df.columns) < 2:
+                    continue
+                # Descarta colunas vazias de nome Unnamed
+                df = df.loc[:, ~df.columns.str.match(r"^Unnamed:\s*\d+$", na=False)]
+                if len(df.columns) < 2:
+                    continue
+                return df
+            except Exception:
+                continue
+    raise ValueError("Não foi possível ler o CSV com nenhum encoding/separador conhecido.")
+
+
+def ensure_table(conn, table: str, schema_def: list[tuple] | None = None, columns_from_df: list[str] | None = None):
+    """
+    Cria a tabela se não existir.
+    schema_def: lista (col, tipo) para tabelas conhecidas.
+    columns_from_df: para tabela generico — colunas do DataFrame (todas como TEXT).
+    """
+    if schema_def:
+        col_defs = ",\n  ".join(f'"{col}" {typ}' for col, typ in schema_def)
+    elif columns_from_df:
+        col_defs = ",\n  ".join(f'"{c}" TEXT' for c in columns_from_df)
+    else:
+        return
     sql = f"""
     CREATE TABLE IF NOT EXISTS public."{table}" (
       id BIGSERIAL PRIMARY KEY,
@@ -175,45 +226,56 @@ def align_df(df: pd.DataFrame, table: str) -> pd.DataFrame:
     """
     Renomeia, sanitiza e alinha o DataFrame ao schema canônico da tabela.
     Colunas faltantes → NULL. Colunas extras → descartadas.
+    Para tabela "generico", sanitiza colunas e adiciona auditoria.
     """
+    df.columns = [sanitize_col(c) for c in df.columns]
+    df["_source_file"] = df.get("_source_file", None)
+    df["_loaded_at"] = datetime.utcnow().isoformat()
+
     schema = SCHEMAS.get(table)
     if not schema:
-        return df   # tabela genérica — envia como veio
+        # Tabela genérica: mantém todas as colunas + auditoria
+        df = df.where(pd.notnull(df), None)
+        return df
 
     # 1. rename mapeado
     rename_map = {k.lower(): v for k, v in schema.get("rename", {}).items()}
-    df.columns = [sanitize_col(c) for c in df.columns]
     df = df.rename(columns=rename_map)
 
-    # 2. adicionar colunas de auditoria
-    df["_source_file"] = df.get("_source_file", None)
-    df["_loaded_at"]   = datetime.utcnow().isoformat()
-
-    # 3. alinhar ao schema canônico
+    # 2. alinhar ao schema canônico
     canonical_cols = [col for col, _ in schema["columns"]]
     for col in canonical_cols:
         if col not in df.columns:
             df[col] = None
     df = df[canonical_cols]
 
-    # 4. converter NaN → None (psycopg2 entende None como NULL)
+    # 3. converter NaN → None (psycopg2 entende None como NULL)
     df = df.where(pd.notnull(df), None)
 
     return df
 
 
 def bulk_insert(conn, table: str, df: pd.DataFrame, chunk_size: int):
-    """Insere em chunks usando execute_values (muito mais rápido que insert linha a linha)."""
+    """Insere em chunks com retry (execute_values)."""
     cols = list(df.columns)
     col_list = ", ".join(f'"{c}"' for c in cols)
     sql = f'INSERT INTO public."{table}" ({col_list}) VALUES %s'
-
-    with conn.cursor() as cur:
-        for i in range(0, len(df), chunk_size):
-            chunk = df.iloc[i : i + chunk_size]
-            rows  = [tuple(row) for row in chunk.itertuples(index=False, name=None)]
-            psycopg2.extras.execute_values(cur, sql, rows, page_size=chunk_size)
-    conn.commit()
+    last_err = None
+    for attempt in range(MAX_DB_RETRIES):
+        try:
+            with conn.cursor() as cur:
+                for i in range(0, len(df), chunk_size):
+                    chunk = df.iloc[i : i + chunk_size]
+                    rows = [tuple(row) for row in chunk.itertuples(index=False, name=None)]
+                    psycopg2.extras.execute_values(cur, sql, rows, page_size=chunk_size)
+            conn.commit()
+            return
+        except Exception as e:
+            last_err = e
+            conn.rollback()
+            if attempt < MAX_DB_RETRIES - 1:
+                time.sleep(RETRY_DELAY_SEC * (attempt + 1))
+    raise last_err
 
 # ──────────────────────────────────────────────────────────────
 # PROCESSAMENTO DE UM ARQUIVO
@@ -231,17 +293,9 @@ def process_file(filename: str, content: bytes) -> dict:
             real_filename = filename[:-3]  # remove o .gz
             result["file"] = real_filename  # mostrar nome original no resultado
 
-        # detecta formato pelo nome real do arquivo
+        # ETL CSV: vários encodings/separadores (mesmo padrão, fontes diferentes)
         if real_filename.lower().endswith(".csv"):
-            for sep in [",", ";", "\t", "|"]:
-                try:
-                    df = pd.read_csv(io.BytesIO(raw_content), sep=sep, encoding="utf-8", on_bad_lines="skip")
-                    if len(df.columns) > 1:
-                        break
-                except Exception:
-                    continue
-            else:
-                df = pd.read_csv(io.BytesIO(raw_content), encoding="latin-1", on_bad_lines="skip")
+            df = read_csv_robust(raw_content)
         else:
             xls = pd.ExcelFile(io.BytesIO(raw_content))
             df = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
@@ -257,7 +311,10 @@ def process_file(filename: str, content: bytes) -> dict:
         try:
             schema_def = SCHEMAS.get(table, {}).get("columns", [])
             if schema_def:
-                ensure_table(conn, table, schema_def)
+                ensure_table(conn, table, schema_def=schema_def)
+            else:
+                # Tabela generico: cria com colunas do CSV (mesmo padrão)
+                ensure_table(conn, table, columns_from_df=list(df.columns))
             bulk_insert(conn, table, df, CONFIG["chunk_size"])
         finally:
             conn.close()
@@ -270,23 +327,109 @@ def process_file(filename: str, content: bytes) -> dict:
     return result
 
 # ──────────────────────────────────────────────────────────────
+# VIEW: BASE ENRIQUECIDA (Pedidos × Produtos × Clientes)
+# Cruza: pedidos.sku → produtos, pedidos.single_id → clientes
+# ──────────────────────────────────────────────────────────────
+VIEW_PEDIDOS_ENRIQUECIDA = """
+CREATE OR REPLACE VIEW public.pedidos_enriquecida AS
+SELECT
+  p.id AS pedido_id,
+  p.cod_pedido,
+  p.id_cliente,
+  p.single_id,
+  p.sku,
+  p.valor_item_pedido,
+  p.valor_item_pedido_frete,
+  p.qtd_itens,
+  p.canal_venda,
+  p.bandeira,
+  p.data_pedido,
+  p.cod_tip_frete,
+  p.descricao_tipo_frete,
+  p.data_atualizacao,
+  p.valor_frete,
+  p.flag_retira,
+  p.data_entrega,
+  p.flag_marketplace,
+  p.flag_lista_casamento,
+  p.id_lista_casamento,
+  p.cod_motivo_cancelamento,
+  p.descricao_motivo_cancelamento,
+  p._source_file AS pedido_source_file,
+  p._loaded_at AS pedido_loaded_at,
+  prod.nome_sku AS produto_nome_sku,
+  prod.nome_marca AS produto_marca,
+  prod.nome_setor_gerencial AS produto_setor,
+  prod.nome_categoria_gerencial AS produto_categoria,
+  prod.url_produto AS produto_url,
+  c.nome AS cliente_nome,
+  c.email AS cliente_email,
+  c.cpf AS cliente_cpf,
+  c.telefone AS cliente_telefone,
+  c.data_cadastro AS cliente_data_cadastro
+FROM public.pedidos p
+LEFT JOIN public.produtos prod ON p.sku = prod.sku
+LEFT JOIN public.clientes c ON p.single_id = c.single_id;
+"""
+
+
+@app.post("/setup-enriquecida")
+def setup_enriquecida():
+    """
+    Cria/atualiza a view pedidos_enriquecida (base final cruzada).
+    Pedidos × Produtos (SKU) × Clientes (single_id).
+    Rode depois de subir as 3 bases.
+    """
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(VIEW_PEDIDOS_ENRIQUECIDA)
+            conn.commit()
+            return {"status": "ok", "message": "View public.pedidos_enriquecida criada/atualizada."}
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ──────────────────────────────────────────────────────────────
 # ENDPOINTS
 # ──────────────────────────────────────────────────────────────
 @app.post("/upload")
-async def upload_files(files: list[UploadFile] = File(...)):
+async def upload_files(
+    files: list[UploadFile] = File(...),
+    replace_pedidos: bool = Form(False),
+):
+    """
+    Upload em lote. Opcional: replace_pedidos=true para troca diária
+    (apaga pedidos antes de inserir os novos).
+    """
     if not files:
         raise HTTPException(400, "Nenhum arquivo enviado.")
     if len(files) > 40:
         raise HTTPException(400, "Máximo de 40 arquivos por vez.")
 
+    if replace_pedidos:
+        try:
+            conn = get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute('TRUNCATE TABLE public.pedidos RESTART IDENTITY CASCADE')
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            raise HTTPException(500, f"Erro ao limpar pedidos: {e}")
+
     file_data = [(f.filename, await f.read()) for f in files]
 
     loop = asyncio.get_event_loop()
     with ThreadPoolExecutor(max_workers=CONFIG["max_workers"]) as pool:
-        tasks   = [loop.run_in_executor(pool, process_file, fn, ct) for fn, ct in file_data]
+        tasks = [loop.run_in_executor(pool, process_file, fn, ct) for fn, ct in file_data]
         results = await asyncio.gather(*tasks)
 
-    ok    = [r for r in results if r["status"] == "ok"]
+    ok = [r for r in results if r["status"] == "ok"]
     error = [r for r in results if r["status"] != "ok"]
     return {"total": len(results), "success": len(ok), "failed": len(error), "results": list(results)}
 
@@ -467,11 +610,25 @@ _HTML = """<!DOCTYPE html>
   <!-- LISTA DE ARQUIVOS -->
   <div id="file-list" class="z1 scroll w-full max-w-3xl flex flex-col gap-2 mb-5"></div>
 
+  <!-- OPÇÃO: TROCA DIÁRIA DE PEDIDOS -->
+  <div class="z1 w-full max-w-3xl mb-3 flex items-center gap-2">
+    <input type="checkbox" id="replace-pedidos" class="rounded border" style="border-color:var(--border);accent-color:var(--accent)" />
+    <label for="replace-pedidos" class="text-sm" style="color:var(--text)">Substituir pedidos (troca diária — apaga a tabela antes de inserir)</label>
+  </div>
+
   <!-- BOTÃO -->
   <div class="z1 w-full max-w-3xl mb-6">
     <button id="upload-btn" class="btn-primary" disabled onclick="startUpload()">
       ⚡ Enviar para Supabase
     </button>
+  </div>
+
+  <!-- BASE ENRIQUECIDA (após subir as bases) -->
+  <div class="z1 w-full max-w-3xl mb-6 p-4 rounded-xl border" style="background:var(--panel);border-color:var(--border)">
+    <p class="mono text-xs uppercase tracking-widest mb-2" style="color:var(--muted)">Base enriquecida</p>
+    <p class="text-sm mb-3" style="color:var(--text)">Depois de subir Clientes, Pedidos e Produtos: crie a view que cruza as 3 tabelas (SKU → produtos, single_id → clientes).</p>
+    <button type="button" onclick="setupEnriquecida()" class="px-4 py-2 rounded-lg text-sm font-medium border transition" style="border-color:var(--accent);color:var(--accent);background:rgba(62,207,142,.08)" onmouseover="this.style.background='rgba(62,207,142,.15)'" onmouseout="this.style.background='rgba(62,207,142,.08)'">Criar/atualizar view pedidos_enriquecida</button>
+    <span id="enriquecida-msg" class="ml-2 text-sm"></span>
   </div>
 
   <!-- PROGRESSO -->
@@ -614,10 +771,12 @@ async function startUpload() {
   const url = window.location.origin + '/upload';
 
   try {
+    const replacePedidos = document.getElementById('replace-pedidos').checked;
     for (let i = 0; i < compressed.length; i += BATCH) {
       const batch = compressed.slice(i, i + BATCH);
       const form  = new FormData();
       for (const f of batch) form.append('files', f);
+      form.append('replace_pedidos', (i === 0 && replacePedidos) ? 'true' : 'false');
 
       label.textContent = `Enviando lote ${Math.floor(i/BATCH)+1} de ${Math.ceil(compressed.length/BATCH)}… (comprimido ${reduction}% menor)`;
       setProgress(30 + Math.round((i / compressed.length) * 60));
@@ -649,6 +808,26 @@ async function startUpload() {
 function setProgress(p) {
   document.getElementById('prog-fill').style.width = p + '%';
   document.getElementById('prog-pct').textContent  = p + '%';
+}
+
+async function setupEnriquecida() {
+  const el = document.getElementById('enriquecida-msg');
+  el.textContent = '…';
+  el.style.color = 'var(--muted)';
+  try {
+    const res = await fetch(window.location.origin + '/setup-enriquecida', { method: 'POST' });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      el.textContent = '✓ ' + (data.message || 'View criada.');
+      el.style.color = 'var(--accent)';
+    } else {
+      el.textContent = '✗ ' + (data.message || 'Erro');
+      el.style.color = 'var(--red)';
+    }
+  } catch (err) {
+    el.textContent = '✗ ' + err.message;
+    el.style.color = 'var(--red)';
+  }
 }
 
 function showResults(data) {
