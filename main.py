@@ -14,15 +14,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
-
 import pandas as pd
 import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
-load_dotenv()
 
 app = FastAPI(title="Supabase Bulk Uploader", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -283,5 +280,13 @@ def health():
     return {"status": "ok", "db_connected": db_ok}
 
 
-if os.path.isdir("static"):
-    app.mount("/", StaticFiles(directory="static", html=True), name="static")
+from fastapi.responses import HTMLResponse
+
+@app.get("/", response_class=HTMLResponse)
+def frontend():
+    # Tenta static/index.html (local) ou index.html (raiz, Vercel)
+    for path in ["static/index.html", "index.html"]:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+    return HTMLResponse("<h2>index.html não encontrado</h2>", status_code=404)
