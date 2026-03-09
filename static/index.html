@@ -115,7 +115,7 @@
       <span class="mono text-xs px-2 py-0.5 rounded border" style="border-color:#1d6648;color:#3ecf8e;background:rgba(62,207,142,.07)">v2.0</span>
     </div>
     <p class="text-sm" style="color:var(--muted)">
-      Envie até <strong style="color:var(--text)">40 arquivos XLSX</strong> —
+      Envie até <strong style="color:var(--text)">40 arquivos XLSX ou CSV</strong> —
       detecção automática do tipo (<span style="color:#93c5fd">pedidos</span> /
       <span style="color:#fbbf24">produtos</span> /
       <span style="color:#c4b5fd">clientes</span>) e insert direto no Supabase.
@@ -139,13 +139,13 @@
   <!-- DROP ZONE -->
   <div id="drop-zone" class="z1 w-full max-w-3xl py-14 flex flex-col items-center gap-3 mb-4"
        onclick="document.getElementById('file-input').click()">
-    <input type="file" id="file-input" multiple accept=".xlsx,.xls" />
+    <input type="file" id="file-input" multiple accept=".xlsx,.xls,.csv" />
     <svg class="w-10 h-10" viewBox="0 0 24 24" fill="none" stroke-width="1.4" style="color:var(--muted)" stroke="currentColor">
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
       <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
     </svg>
     <p class="text-sm font-medium">Arraste os XLSXs aqui</p>
-    <p class="text-xs" style="color:var(--muted)">clique para selecionar · máx 40 arquivos</p>
+    <p class="text-xs" style="color:var(--muted)">clique para selecionar · .xlsx .xls .csv · máx 40 arquivos</p>
   </div>
 
   <!-- CONTADOR + LIMPAR -->
@@ -203,7 +203,7 @@ zone.addEventListener('drop', e => { e.preventDefault(); zone.classList.remove('
 document.getElementById('file-input').addEventListener('change', e => { addFiles([...e.target.files]); e.target.value=''; });
 
 function addFiles(files) {
-  const xlsx = files.filter(f => f.name.match(/\.(xlsx|xls)$/i));
+  const xlsx = files.filter(f => f.name.match(/\.(xlsx|xls|csv)$/i));
   for (const f of xlsx) {
     if (selectedFiles.length >= 40) { alert('Máximo de 40 arquivos!'); break; }
     if (!selectedFiles.find(x => x.name === f.name)) selectedFiles.push(f);
@@ -219,6 +219,7 @@ function clearAll() {
 
 // Detecta tipo do arquivo pelo nome (rápido, sem ler o xlsx)
 function guessType(name) {
+  // CSV herda o mesmo tipo pelo nome
   const n = name.toLowerCase();
   if (/pedido|order/i.test(n))   return 'pedidos';
   if (/sku|produto|product/i.test(n)) return 'produtos';

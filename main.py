@@ -220,9 +220,21 @@ def process_file(filename: str, content: bytes) -> dict:
     result = {"file": filename, "status": "ok", "rows": 0, "table": "", "elapsed_s": 0, "error": None}
 
     try:
-        xls = pd.ExcelFile(io.BytesIO(content))
-        # lê a primeira aba
-        df = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
+        # detecta formato pelo nome do arquivo
+        if filename.lower().endswith(".csv"):
+            # tenta separadores comuns automaticamente
+            for sep in [",", ";", "\t", "|"]:
+                try:
+                    df = pd.read_csv(io.BytesIO(content), sep=sep, encoding="utf-8", on_bad_lines="skip")
+                    if len(df.columns) > 1:
+                        break
+                except Exception:
+                    continue
+            else:
+                df = pd.read_csv(io.BytesIO(content), encoding="latin-1", on_bad_lines="skip")
+        else:
+            xls = pd.ExcelFile(io.BytesIO(content))
+            df = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
         df = df.dropna(how="all")
 
         table   = detect_table(list(df.columns))
