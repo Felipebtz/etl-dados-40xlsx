@@ -166,6 +166,12 @@
     <label for="replace-pedidos" class="text-sm" style="color:var(--text)">Substituir pedidos (troca diária)</label>
   </div>
 
+  <!-- OPÇÃO: SEM COMPRIMIR (arquivos grandes) -->
+  <div class="z1 w-full max-w-3xl mb-3 flex items-center gap-2">
+    <input type="checkbox" id="no-compress" class="rounded border" style="border-color:var(--border);accent-color:var(--accent)" />
+    <label for="no-compress" class="text-sm" style="color:var(--text)">Enviar sem comprimir (recomendado para muitos ou arquivos grandes)</label>
+  </div>
+
   <!-- BOTÃO -->
   <div class="z1 w-full max-w-3xl mb-6">
     <button id="upload-btn" class="btn-primary" disabled onclick="startUpload()">
@@ -283,56 +289,62 @@ async function compressFile(file) {
   return new File([compressedBlob], file.name + '.gz', { type: 'application/gzip' });
 }
 
-// ── UPLOAD COM COMPRESSÃO ────────────────────────────────────
+// ── UPLOAD (lotes pequenos; opção sem comprimir para arquivos grandes) ──
+const BATCH_SIZE = 3;  // poucos arquivos por vez para evitar limite e erro de compressão
+
 async function startUpload() {
   const btn = document.getElementById('upload-btn');
-  btn.disabled = true; btn.textContent = '⏳ Comprimindo…';
-
   const ps = document.getElementById('prog-sec');
-  ps.classList.remove('hidden');
-  setProgress(5);
-
-  // 1. Comprimir todos os arquivos em paralelo
   const label = document.getElementById('prog-label');
-  label.textContent = 'Comprimindo arquivos…';
+  ps.classList.remove('hidden');
   label.classList.add('pulse');
 
-  let compressed;
-  try {
-    compressed = await Promise.all(selectedFiles.map(compressFile));
-  } catch (err) {
-    label.textContent = '✗ Erro ao comprimir: ' + err.message;
-    label.classList.remove('pulse');
-    label.style.color = 'var(--red)';
-    btn.disabled = false; btn.textContent = '⚡ Enviar para Supabase';
-    return;
+  const noCompress = document.getElementById('no-compress').checked;
+  const replacePedidos = document.getElementById('replace-pedidos').checked;
+  const url = window.location.origin + '/upload';
+  let filesToSend;
+
+  if (noCompress) {
+    btn.disabled = true; btn.textContent = '⏳ Enviando…';
+    setProgress(10);
+    label.textContent = 'Enviando sem comprimir (lotes de ' + BATCH_SIZE + ' arquivos)…';
+    filesToSend = selectedFiles;
+  } else {
+    btn.disabled = true; btn.textContent = '⏳ Comprimindo…';
+    setProgress(5);
+    label.textContent = 'Comprimindo arquivos…';
+    try {
+      filesToSend = await Promise.all(selectedFiles.map(compressFile));
+      const originalSize  = selectedFiles.reduce((s, f) => s + f.size, 0);
+      const compressedSize = filesToSend.reduce((s, f) => s + f.size, 0);
+      const reduction = Math.round((1 - compressedSize / originalSize) * 100);
+      label.textContent = 'Enviando… (comprimido ' + reduction + '% menor, lotes de ' + BATCH_SIZE + ')';
+    } catch (err) {
+      label.textContent = '✗ Erro ao comprimir: ' + err.message;
+      label.classList.remove('pulse');
+      label.style.color = 'var(--red)';
+      btn.disabled = false; btn.textContent = '⚡ Enviar para Supabase';
+      return;
+    }
+    setProgress(20);
   }
 
-  // Mostrar redução de tamanho
-  const originalSize  = selectedFiles.reduce((s, f) => s + f.size, 0);
-  const compressedSize = compressed.reduce((s, f) => s + f.size, 0);
-  const reduction = Math.round((1 - compressedSize / originalSize) * 100);
-  label.textContent = `Enviando… (comprimido ${reduction}% menor)`;
-  setProgress(30);
-
-  // 2. Enviar em lotes de 10
-  const BATCH = 10;
   const allResults = [];
-  const url = window.location.origin + '/upload';
-  const replacePedidos = document.getElementById('replace-pedidos').checked;
+  const totalBatches = Math.ceil(filesToSend.length / BATCH_SIZE);
 
   try {
-    for (let i = 0; i < compressed.length; i += BATCH) {
-      const batch = compressed.slice(i, i + BATCH);
+    for (let i = 0; i < filesToSend.length; i += BATCH_SIZE) {
+      const batch = filesToSend.slice(i, i + BATCH_SIZE);
       const form  = new FormData();
       for (const f of batch) form.append('files', f);
       form.append('replace_pedidos', (i === 0 && replacePedidos) ? 'true' : 'false');
 
-      label.textContent = `Enviando lote ${Math.floor(i/BATCH)+1} de ${Math.ceil(compressed.length/BATCH)}… (comprimido ${reduction}% menor)`;
-      setProgress(30 + Math.round((i / compressed.length) * 60));
+      const currentBatch = Math.floor(i / BATCH_SIZE) + 1;
+      label.textContent = 'Enviando lote ' + currentBatch + ' de ' + totalBatches + '…';
+      setProgress(20 + Math.round((i / filesToSend.length) * 75));
 
       const res = await fetch(url, { method: 'POST', body: form });
-      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
       const data = await res.json();
       allResults.push(...data.results);
     }
