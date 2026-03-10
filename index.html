@@ -146,6 +146,7 @@
     </svg>
     <p class="text-sm font-medium">Arraste os XLSXs aqui</p>
     <p class="text-xs" style="color:var(--muted)">clique para selecionar · .xlsx .xls .csv · máx 40 arquivos</p>
+    <p class="text-xs mt-1" style="color:var(--muted)">Na Vercel: cada arquivo até ~4,5 MB. Maior que isso use Railway/Render.</p>
   </div>
 
   <!-- CONTADOR + LIMPAR -->
@@ -291,6 +292,7 @@ async function compressFile(file) {
 
 // ── UPLOAD (1 arquivo por requisição para evitar 413 Payload Too Large na Vercel) ──
 const BATCH_SIZE = 1;
+const VERCEL_MAX_BODY_MB = 4.5;  // limite aproximado por requisição na Vercel (Hobby)
 
 async function startUpload() {
   const btn = document.getElementById('upload-btn');
@@ -298,6 +300,18 @@ async function startUpload() {
   const label = document.getElementById('prog-label');
   ps.classList.remove('hidden');
   label.classList.add('pulse');
+
+  const maxBytes = VERCEL_MAX_BODY_MB * 1024 * 1024;
+  const tooLarge = selectedFiles.filter(f => f.size > maxBytes);
+  if (tooLarge.length > 0) {
+    const names = tooLarge.map(f => f.name + ' (' + (f.size / 1024 / 1024).toFixed(1) + ' MB)').join(', ');
+    label.textContent = '';
+    label.classList.remove('pulse');
+    ps.classList.add('hidden');
+    btn.disabled = false;
+    alert('Arquivo(s) acima do limite da Vercel (~' + VERCEL_MAX_BODY_MB + ' MB por arquivo):\n\n' + names + '\n\nNa Vercel cada requisição tem limite de ~4,5 MB. Para arquivos maiores, use Railway, Render ou outro host com limite maior.');
+    return;
+  }
 
   const noCompress = document.getElementById('no-compress').checked;
   const replacePedidos = document.getElementById('replace-pedidos').checked;

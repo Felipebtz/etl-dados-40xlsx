@@ -4,6 +4,9 @@ Detecta automaticamente o tipo de arquivo (pedidos / produtos / clientes)
 e insere na tabela correta via conexão direta PostgreSQL (psycopg2 + COPY).
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import gzip
 import io
