@@ -1,168 +1,167 @@
 """
-Supabase Bulk XLSX Uploader
-Detecta automaticamente o tipo de arquivo (pedidos / produtos / clientes)
-e insere na tabela correta via conexão direta PostgreSQL (psycopg2 + COPY).
+GCP Bulk Uploader
+Recebe ZIP via Cloud Storage, processa XLSX/CSV em chunks e carrega no BigQuery.
+Detecta automaticamente o tipo de arquivo (pedidos / produtos / clientes).
 """
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import asyncio
 import gzip
 import io
+import json
 import os
 import re
 import tempfile
 import time
 import traceback
+import uuid
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-import httpx
 import pandas as pd
-
-# Encodings e separadores para CSVs (mesmo padrão, origens diferentes)
-CSV_ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1", "iso-8859-1")
-CSV_SEPARATORS = (",", ";", "\t", "|")
-MAX_DB_RETRIES = 3
-RETRY_DELAY_SEC = 1
-import psycopg2
-import psycopg2.extras
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
-app = FastAPI(title="Supabase Bulk Uploader", version="2.0.0")
+# ── GCP ──────────────────────────────────────────────────────
+from google.cloud import bigquery, storage
+from google.oauth2 import service_account
 
-# Sem limite de body size (default Starlette é 100MB)
-# Para Vercel, o limite real é controlado pelo vercel.json
+app = FastAPI(title="GCP Bulk Uploader", version="5.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ──────────────────────────────────────────────────────────────
-# CONFIGURAÇÃO — edite aqui ou use variáveis de ambiente
+# CONFIGURAÇÃO
 # ──────────────────────────────────────────────────────────────
+# GCP_SERVICE_ACCOUNT_JSON → conteúdo do JSON da service account (variável no Railway)
+# GCP_PROJECT_ID           → ID do projeto GCP
+# GCP_BUCKET               → nome do bucket Cloud Storage
+# GCP_DATASET              → nome do dataset BigQuery (ex: etl_dados)
+
+def _get_gcp_credentials():
+    """Carrega credenciais da variável de ambiente GCP_SERVICE_ACCOUNT_JSON."""
+    raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "")
+    if not raw:
+        raise RuntimeError(
+            "GCP_SERVICE_ACCOUNT_JSON não configurada! "
+            "Railway → Variables → adicione o conteúdo do JSON da service account."
+        )
+    info = json.loads(raw)
+    return service_account.Credentials.from_service_account_info(
+        info,
+        scopes=[
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/bigquery",
+        ],
+    )
+
 CONFIG = {
-    # Supabase → Settings → Database → Connection string (Transaction mode)
-    # Nota: @ na senha precisa ser escapado como %40
-    "database_url": os.getenv("DATABASE_URL", ""),
-    "max_workers": int(os.getenv("MAX_WORKERS", "8")),
-    "chunk_size":  int(os.getenv("CHUNK_SIZE",  "1000")),
+    "project_id": os.getenv("GCP_PROJECT_ID", ""),
+    "bucket":     os.getenv("GCP_BUCKET", ""),
+    "dataset":    os.getenv("GCP_DATASET", "etl_dados"),
+    "chunk_size": int(os.getenv("CHUNK_SIZE", "1000")),
 }
 
-# ──────────────────────────────────────────────────────────────
-# SUPABASE STORAGE — para upload direto do browser e download pelo backend
-# Variáveis de ambiente obrigatórias para o fluxo Storage:
-#   SUPABASE_URL    = https://<projeto>.supabase.co
-#   SUPABASE_KEY    = service_role key (Settings → API)
-#   STORAGE_BUCKET  = nome do bucket (ex: "etl-uploads")
-# ──────────────────────────────────────────────────────────────
-STORAGE = {
-    "url":    os.getenv("SUPABASE_URL", ""),
-    "key":    os.getenv("SUPABASE_KEY", ""),
-    "bucket": os.getenv("STORAGE_BUCKET", "etl-uploads"),
-}
+ROWS_PER_BATCH = int(os.getenv("ROWS_PER_BATCH", "50000"))
+
+CSV_ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1", "iso-8859-1")
+CSV_SEPARATORS = (",", ";", "\t", "|")
 
 # ──────────────────────────────────────────────────────────────
-# SCHEMA DE CADA TABELA
-# Colunas canônicas + tipos SQL usados no CREATE TABLE automático
+# SCHEMAS — mapeamento para tipos BigQuery
 # ──────────────────────────────────────────────────────────────
+# BigQuery types: STRING, INT64, FLOAT64, NUMERIC, BOOL, DATE, TIMESTAMP
+BQ_TYPE_MAP = {
+    "TEXT":        "STRING",
+    "BIGINT":      "INT64",
+    "INTEGER":     "INT64",
+    "NUMERIC":     "NUMERIC",
+    "BOOLEAN":     "BOOL",
+    "DATE":        "DATE",
+    "TIMESTAMPTZ": "TIMESTAMP",
+}
+
 SCHEMAS = {
     "pedidos": {
         "columns": [
-            ("cod_pedido",                     "BIGINT"),
-            ("id_cliente",                     "BIGINT"),
-            ("single_id",                      "TEXT"),
-            ("sku",                            "BIGINT"),
-            ("valor_item_pedido",              "NUMERIC"),
-            ("valor_item_pedido_frete",        "NUMERIC"),
-            ("qtd_itens",                      "INTEGER"),
-            ("canal_venda",                    "TEXT"),
-            ("bandeira",                       "TEXT"),
-            ("data_pedido",                    "DATE"),
-            ("cod_tip_frete",                  "INTEGER"),
-            ("descricao_tipo_frete",           "TEXT"),
-            ("data_atualizacao",               "DATE"),
-            ("valor_frete",                    "NUMERIC"),
-            ("flag_retira",                    "BOOLEAN"),
-            ("data_entrega",                   "TEXT"),
-            ("flag_marketplace",               "BOOLEAN"),
-            ("flag_lista_casamento",           "BOOLEAN"),
-            ("id_lista_casamento",             "BIGINT"),
-            ("cod_motivo_cancelamento",        "INTEGER"),
-            ("descricao_motivo_cancelamento",  "TEXT"),
-            ("_source_file",                   "TEXT"),
-            ("_loaded_at",                     "TIMESTAMPTZ"),
-        ],
-        # colunas originais do xlsx → nome canônico (case-insensitive, strip)
-        "rename": {},   # já estão idênticas após sanitize
-    },
-
-    "produtos": {
-        "columns": [
-            ("sku",                                  "BIGINT"),
-            ("nome_sku",                             "TEXT"),
-            ("nome_agrupamento_diretoria_setor",     "TEXT"),
-            ("nome_setor_gerencial",                 "TEXT"),
-            ("nome_classe_gerencial",                "TEXT"),
-            ("nome_especie_gerencial",               "TEXT"),
-            ("nome_categoria_gerencial",             "TEXT"),
-            ("nome_categoria_pai_gerencial",         "TEXT"),
-            ("nome_departamento_pai_gerencial",      "TEXT"),
-            ("nome_setor_origem",                    "TEXT"),
-            ("nome_classe_origem",                   "TEXT"),
-            ("nome_especie_origem",                  "TEXT"),
-            ("nome_sub_especie",                     "TEXT"),
-            ("nome_categoria_origem",                "TEXT"),
-            ("nome_categoria_pai_origem",            "TEXT"),
-            ("nome_departamento_pai_origem",         "TEXT"),
-            ("nome_tipo_sku",                        "TEXT"),
-            ("nome_marca",                           "TEXT"),
-            ("nome_diretoria_setor_alternativa",     "TEXT"),
-            ("nome_setor_alternativo",               "TEXT"),
-            ("url_produto",                          "TEXT"),
-            ("_source_file",                         "TEXT"),
-            ("_loaded_at",                           "TIMESTAMPTZ"),
+            ("cod_pedido",                    "INT64"),
+            ("id_cliente",                    "INT64"),
+            ("single_id",                     "STRING"),
+            ("sku",                           "INT64"),
+            ("valor_item_pedido",             "NUMERIC"),
+            ("valor_item_pedido_frete",       "NUMERIC"),
+            ("qtd_itens",                     "INT64"),
+            ("canal_venda",                   "STRING"),
+            ("bandeira",                      "STRING"),
+            ("data_pedido",                   "DATE"),
+            ("cod_tip_frete",                 "INT64"),
+            ("descricao_tipo_frete",          "STRING"),
+            ("data_atualizacao",              "DATE"),
+            ("valor_frete",                   "NUMERIC"),
+            ("flag_retira",                   "BOOL"),
+            ("data_entrega",                  "STRING"),
+            ("flag_marketplace",              "BOOL"),
+            ("flag_lista_casamento",          "BOOL"),
+            ("id_lista_casamento",            "INT64"),
+            ("cod_motivo_cancelamento",       "INT64"),
+            ("descricao_motivo_cancelamento", "STRING"),
+            ("_source_file",                  "STRING"),
+            ("_loaded_at",                    "TIMESTAMP"),
         ],
         "rename": {},
     },
-
-    # Tabela genérica para os outros 20 arquivos de clientes
-    # → adapte as colunas conforme seus arquivos reais
+    "produtos": {
+        "columns": [
+            ("sku",                                 "INT64"),
+            ("nome_sku",                            "STRING"),
+            ("nome_agrupamento_diretoria_setor",    "STRING"),
+            ("nome_setor_gerencial",                "STRING"),
+            ("nome_classe_gerencial",               "STRING"),
+            ("nome_especie_gerencial",              "STRING"),
+            ("nome_categoria_gerencial",            "STRING"),
+            ("nome_categoria_pai_gerencial",        "STRING"),
+            ("nome_departamento_pai_gerencial",     "STRING"),
+            ("nome_setor_origem",                   "STRING"),
+            ("nome_classe_origem",                  "STRING"),
+            ("nome_especie_origem",                 "STRING"),
+            ("nome_sub_especie",                    "STRING"),
+            ("nome_categoria_origem",               "STRING"),
+            ("nome_categoria_pai_origem",           "STRING"),
+            ("nome_departamento_pai_origem",        "STRING"),
+            ("nome_tipo_sku",                       "STRING"),
+            ("nome_marca",                          "STRING"),
+            ("nome_diretoria_setor_alternativa",    "STRING"),
+            ("nome_setor_alternativo",              "STRING"),
+            ("url_produto",                         "STRING"),
+            ("_source_file",                        "STRING"),
+            ("_loaded_at",                          "TIMESTAMP"),
+        ],
+        "rename": {},
+    },
     "clientes": {
         "columns": [
-            ("id_cliente",     "BIGINT"),
-            ("single_id",      "TEXT"),
-            ("nome",           "TEXT"),
-            ("email",          "TEXT"),
-            ("cpf",            "TEXT"),
-            ("telefone",       "TEXT"),
-            ("data_cadastro",  "DATE"),
-            ("_source_file",   "TEXT"),
-            ("_loaded_at",     "TIMESTAMPTZ"),
+            ("id_cliente",    "INT64"),
+            ("single_id",     "STRING"),
+            ("nome",          "STRING"),
+            ("email",         "STRING"),
+            ("cpf",           "STRING"),
+            ("telefone",      "STRING"),
+            ("data_cadastro", "DATE"),
+            ("_source_file",  "STRING"),
+            ("_loaded_at",    "TIMESTAMP"),
         ],
-        "rename": {
-            # exemplo: "NOME_CLIENTE" → "nome"
-        },
+        "rename": {},
     },
 }
 
-# ──────────────────────────────────────────────────────────────
-# DETECÇÃO AUTOMÁTICA DO TIPO
-# ──────────────────────────────────────────────────────────────
-# Fingerprints: conjuntos de colunas que identificam unicamente cada tipo
 FINGERPRINTS = {
     "pedidos":  {"cod_pedido", "id_cliente", "sku", "canal_venda", "bandeira"},
     "produtos": {"nome_sku", "nome_setor_gerencial", "nome_marca", "url_produto"},
-    "clientes": {"id_cliente", "single_id"},   # fallback — adapte
+    "clientes": {"id_cliente", "single_id"},
 }
-
-def detect_table(df_columns: list[str]) -> str:
-    cols = {sanitize_col(c) for c in df_columns}
-    scores = {}
-    for table, fingerprint in FINGERPRINTS.items():
-        scores[table] = len(fingerprint & cols) / len(fingerprint)
-    best = max(scores, key=scores.get)
-    if scores[best] < 0.4:
-        return "generico"   # nenhum schema conhecido
-    return best
 
 # ──────────────────────────────────────────────────────────────
 # HELPERS
@@ -174,253 +173,168 @@ def sanitize_col(name: str) -> str:
         name = "col_" + name
     return name.lower()
 
-
-def get_conn():
-    """Conexão com retry para falhas transitórias (ex.: Vercel/serverless)."""
-    last_err = None
-    for attempt in range(MAX_DB_RETRIES):
-        try:
-            return psycopg2.connect(CONFIG["database_url"])
-        except Exception as e:
-            last_err = e
-            if attempt < MAX_DB_RETRIES - 1:
-                time.sleep(RETRY_DELAY_SEC * (attempt + 1))
-    raise last_err
-
-
-# Tamanho do lote de linhas processado por vez (RAM controlada)
-ROWS_PER_BATCH = int(os.getenv("ROWS_PER_BATCH", "50000"))  # ~50k linhas por vez
-
+def detect_table(df_columns: list[str]) -> str:
+    cols = {sanitize_col(c) for c in df_columns}
+    scores = {t: len(fp & cols) / len(fp) for t, fp in FINGERPRINTS.items()}
+    best = max(scores, key=scores.get)
+    return best if scores[best] >= 0.4 else "generico"
 
 def _clean_chunk(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove colunas Unnamed, normaliza vazios para None."""
     df = df.loc[:, ~df.columns.str.match(r"^Unnamed:\s*\d+$", na=False)]
     return df.replace({"": None, "nan": None, "NaN": None, "None": None, "NULL": None})
 
-
-def _detect_csv_params(raw_content: bytes) -> tuple[str, str]:
-    """Detecta encoding e separador lendo só as primeiras linhas do CSV."""
-    sample = raw_content[:65536]  # primeiros 64 KB
-    for encoding in CSV_ENCODINGS:
-        for sep in CSV_SEPARATORS:
-            try:
-                df = pd.read_csv(
-                    io.BytesIO(sample),
-                    sep=sep,
-                    encoding=encoding,
-                    on_bad_lines="skip",
-                    dtype=str,
-                    keep_default_na=False,
-                    nrows=5,
-                )
-                if len(df.columns) >= 2:
-                    return encoding, sep
-            except Exception:
-                continue
-    raise ValueError("Não foi possível detectar encoding/separador do CSV.")
-
-
-def stream_csv(raw_content: bytes, filename: str, conn, table_hint: str | None = None):
-    """
-    Lê CSV em lotes de ROWS_PER_BATCH linhas — nunca carrega tudo na RAM.
-    Retorna (table, total_rows).
-    """
-    encoding, sep = _detect_csv_params(raw_content)
-    reader = pd.read_csv(
-        io.BytesIO(raw_content),
-        sep=sep,
-        encoding=encoding,
-        on_bad_lines="skip",
-        dtype=str,
-        keep_default_na=False,
-        chunksize=ROWS_PER_BATCH,  # ← streaming: 1 lote de cada vez
-    )
-
-    table      = None
-    total_rows = 0
-    table_created = False
-
-    for batch in reader:
-        batch = _clean_chunk(batch)
-        batch = batch.dropna(how="all")
-        if batch.empty:
-            continue
-
-        # Detecta tabela no primeiro lote (colunas são sempre as mesmas)
-        if table is None:
-            table = table_hint or detect_table(list(batch.columns))
-
-        batch["_source_file"] = filename
-        batch = align_df(batch, table)
-
-        # Cria tabela só uma vez
-        if not table_created:
-            schema_def = SCHEMAS.get(table, {}).get("columns", [])
-            if schema_def:
-                ensure_table(conn, table, schema_def=schema_def)
-            else:
-                ensure_table(conn, table, columns_from_df=list(batch.columns))
-            table_created = True
-
-        bulk_insert(conn, table, batch, CONFIG["chunk_size"])
-        total_rows += len(batch)
-        del batch  # libera RAM do lote imediatamente
-
-    return table or "generico", total_rows
-
-
-def stream_xlsx(raw_content: bytes, filename: str, conn, table_hint: str | None = None):
-    """
-    Lê XLSX linha por linha com openpyxl (read_only=True) em lotes de ROWS_PER_BATCH.
-    Nunca carrega a planilha inteira na RAM.
-    Retorna (table, total_rows).
-    """
-    import openpyxl
-
-    wb = openpyxl.load_workbook(io.BytesIO(raw_content), read_only=True, data_only=True)
-    ws = wb.active
-
-    table      = None
-    total_rows = 0
-    table_created = False
-    headers    = None
-    batch_rows = []
-
-    def flush_batch(batch_rows, headers):
-        nonlocal table, table_created, total_rows
-        df = pd.DataFrame(batch_rows, columns=headers, dtype=str)
-        df = _clean_chunk(df)
-        df = df.dropna(how="all")
-        if df.empty:
-            return
-
-        if table is None:
-            table = table_hint or detect_table(list(df.columns))
-
-        df["_source_file"] = filename
-        df = align_df(df, table)
-
-        if not table_created:
-            schema_def = SCHEMAS.get(table, {}).get("columns", [])
-            if schema_def:
-                ensure_table(conn, table, schema_def=schema_def)
-            else:
-                ensure_table(conn, table, columns_from_df=list(df.columns))
-            table_created = True
-
-        bulk_insert(conn, table, df, CONFIG["chunk_size"])
-        total_rows += len(df)
-        del df
-
-    for i, row in enumerate(ws.iter_rows(values_only=True)):
-        if i == 0:
-            # Primeira linha = cabeçalho
-            headers = [str(c) if c is not None else f"col_{j}" for j, c in enumerate(row)]
-            continue
-
-        batch_rows.append([str(v) if v is not None else None for v in row])
-
-        if len(batch_rows) >= ROWS_PER_BATCH:
-            flush_batch(batch_rows, headers)
-            batch_rows = []  # libera RAM
-
-    # Último lote
-    if batch_rows:
-        flush_batch(batch_rows, headers)
-
-    wb.close()
-    return table or "generico", total_rows
-
-
-def ensure_table(conn, table: str, schema_def: list[tuple] | None = None, columns_from_df: list[str] | None = None):
-    """
-    Cria a tabela se não existir.
-    schema_def: lista (col, tipo) para tabelas conhecidas.
-    columns_from_df: para tabela generico — colunas do DataFrame (todas como TEXT).
-    """
-    if schema_def:
-        col_defs = ",\n  ".join(f'"{col}" {typ}' for col, typ in schema_def)
-    elif columns_from_df:
-        col_defs = ",\n  ".join(f'"{c}" TEXT' for c in columns_from_df)
-    else:
-        return
-    sql = f"""
-    CREATE TABLE IF NOT EXISTS public."{table}" (
-      id BIGSERIAL PRIMARY KEY,
-      {col_defs}
-    );
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql)
-    conn.commit()
-
-
-def align_df(df: pd.DataFrame, table: str) -> pd.DataFrame:
-    """
-    Renomeia, sanitiza e alinha o DataFrame ao schema canônico da tabela.
-    Colunas faltantes → NULL. Colunas extras → descartadas.
-    Para tabela "generico", sanitiza colunas e adiciona auditoria.
-    """
+def align_df(df: pd.DataFrame, table: str, source_file: str) -> pd.DataFrame:
     df.columns = [sanitize_col(c) for c in df.columns]
-    df["_source_file"] = df.get("_source_file", None)
-    df["_loaded_at"] = datetime.utcnow().isoformat()
+    df["_source_file"] = source_file
+    df["_loaded_at"]   = datetime.now(timezone.utc).isoformat()
 
     schema = SCHEMAS.get(table)
     if not schema:
-        # Tabela genérica: mantém todas as colunas + auditoria
-        df = df.where(pd.notnull(df), None)
-        return df
+        return df.where(pd.notnull(df), None)
 
-    # 1. rename mapeado
     rename_map = {k.lower(): v for k, v in schema.get("rename", {}).items()}
     df = df.rename(columns=rename_map)
 
-    # 2. alinhar ao schema canônico
     canonical_cols = [col for col, _ in schema["columns"]]
     for col in canonical_cols:
         if col not in df.columns:
             df[col] = None
     df = df[canonical_cols]
-
-    # 3. converter NaN/strings vazias → None (psycopg2 entende None como NULL)
-    df = df.where(pd.notnull(df), None)
-    df = df.replace({"": None, "nan": None, "NaN": None})
-
-    return df
-
-
-def bulk_insert(conn, table: str, df: pd.DataFrame, chunk_size: int):
-    """Insere em chunks com retry (execute_values)."""
-    cols = list(df.columns)
-    col_list = ", ".join(f'"{c}"' for c in cols)
-    sql = f'INSERT INTO public."{table}" ({col_list}) VALUES %s'
-    last_err = None
-    for attempt in range(MAX_DB_RETRIES):
-        try:
-            with conn.cursor() as cur:
-                for i in range(0, len(df), chunk_size):
-                    chunk = df.iloc[i : i + chunk_size]
-                    rows = [tuple(row) for row in chunk.itertuples(index=False, name=None)]
-                    psycopg2.extras.execute_values(cur, sql, rows, page_size=chunk_size)
-            conn.commit()
-            return
-        except Exception as e:
-            last_err = e
-            conn.rollback()
-            if attempt < MAX_DB_RETRIES - 1:
-                time.sleep(RETRY_DELAY_SEC * (attempt + 1))
-    raise last_err
+    return df.where(pd.notnull(df), None)
 
 # ──────────────────────────────────────────────────────────────
-# PROCESSAMENTO DE UM ARQUIVO — streaming por lotes
-# Nunca carrega o arquivo inteiro na RAM
+# BIGQUERY — criar tabela + inserir em lotes
+# ──────────────────────────────────────────────────────────────
+def get_bq_client():
+    creds = _get_gcp_credentials()
+    return bigquery.Client(project=CONFIG["project_id"], credentials=creds)
+
+def ensure_bq_table(bq: bigquery.Client, table_id: str, schema_def: list[tuple]):
+    """Cria a tabela no BigQuery se não existir."""
+    full_id = f"{CONFIG['project_id']}.{CONFIG['dataset']}.{table_id}"
+    schema  = [bigquery.SchemaField(col, typ) for col, typ in schema_def]
+    table   = bigquery.Table(full_id, schema=schema)
+    table.time_partitioning = bigquery.TimePartitioning(field="_loaded_at")
+    bq.create_table(table, exists_ok=True)
+    return full_id
+
+def ensure_bq_dataset(bq: bigquery.Client):
+    """Cria o dataset se não existir."""
+    dataset_id = f"{CONFIG['project_id']}.{CONFIG['dataset']}"
+    dataset    = bigquery.Dataset(dataset_id)
+    dataset.location = os.getenv("GCP_LOCATION", "US")
+    bq.create_dataset(dataset, exists_ok=True)
+
+def bq_insert_batch(bq: bigquery.Client, full_table_id: str, df: pd.DataFrame):
+    """Insere um DataFrame no BigQuery via streaming insert (rows_to_insert)."""
+    chunk_size = CONFIG["chunk_size"]
+    errors_all = []
+    for i in range(0, len(df), chunk_size):
+        chunk  = df.iloc[i: i + chunk_size]
+        rows   = chunk.to_dict(orient="records")
+        errors = bq.insert_rows_json(full_table_id, rows)
+        if errors:
+            errors_all.extend(errors)
+    if errors_all:
+        raise RuntimeError(f"BigQuery insert errors: {errors_all[:3]}")
+
+# ──────────────────────────────────────────────────────────────
+# STREAMING CSV — lê em chunks sem carregar tudo na RAM
+# ──────────────────────────────────────────────────────────────
+def _detect_csv_params(raw_content: bytes) -> tuple[str, str]:
+    sample = raw_content[:65536]
+    for enc in CSV_ENCODINGS:
+        for sep in CSV_SEPARATORS:
+            try:
+                df = pd.read_csv(io.BytesIO(sample), sep=sep, encoding=enc,
+                                 on_bad_lines="skip", dtype=str, keep_default_na=False, nrows=5)
+                if len(df.columns) >= 2:
+                    return enc, sep
+            except Exception:
+                continue
+    raise ValueError("Não foi possível detectar encoding/separador do CSV.")
+
+def stream_csv(raw_content: bytes, filename: str, bq_client: bigquery.Client) -> tuple[str, int]:
+    enc, sep = _detect_csv_params(raw_content)
+    reader   = pd.read_csv(io.BytesIO(raw_content), sep=sep, encoding=enc,
+                           on_bad_lines="skip", dtype=str, keep_default_na=False,
+                           chunksize=ROWS_PER_BATCH)
+    table       = None
+    total_rows  = 0
+    full_tbl_id = None
+
+    for batch in reader:
+        batch = _clean_chunk(batch).dropna(how="all")
+        if batch.empty:
+            continue
+        if table is None:
+            table      = detect_table(list(batch.columns))
+            schema_def = SCHEMAS.get(table, {}).get("columns") or \
+                         [(sanitize_col(c), "STRING") for c in batch.columns]
+            full_tbl_id = ensure_bq_table(bq_client, table, schema_def)
+
+        batch = align_df(batch, table, filename)
+        bq_insert_batch(bq_client, full_tbl_id, batch)
+        total_rows += len(batch)
+        del batch
+
+    return table or "generico", total_rows
+
+# ──────────────────────────────────────────────────────────────
+# STREAMING XLSX — openpyxl read_only, linha por linha
+# ──────────────────────────────────────────────────────────────
+def stream_xlsx(raw_content: bytes, filename: str, bq_client: bigquery.Client) -> tuple[str, int]:
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(raw_content), read_only=True, data_only=True)
+    ws = wb.active
+
+    table       = None
+    total_rows  = 0
+    full_tbl_id = None
+    headers     = None
+    batch_rows  = []
+
+    def flush(rows):
+        nonlocal table, full_tbl_id, total_rows
+        df = pd.DataFrame(rows, columns=headers, dtype=str)
+        df = _clean_chunk(df).dropna(how="all")
+        if df.empty:
+            return
+
+        if table is None:
+            t = detect_table(list(df.columns))
+            table       = t
+            schema_def  = SCHEMAS.get(table, {}).get("columns") or \
+                          [(sanitize_col(c), "STRING") for c in df.columns]
+            full_tbl_id = ensure_bq_table(bq_client, table, schema_def)
+
+        df = align_df(df, table, filename)
+        bq_insert_batch(bq_client, full_tbl_id, df)
+        total_rows += len(df)
+        del df
+
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        if i == 0:
+            headers = [str(c) if c is not None else f"col_{j}" for j, c in enumerate(row)]
+            continue
+        batch_rows.append([str(v) if v is not None else None for v in row])
+        if len(batch_rows) >= ROWS_PER_BATCH:
+            flush(batch_rows)
+            batch_rows = []
+
+    if batch_rows:
+        flush(batch_rows)
+
+    wb.close()
+    return table or "generico", total_rows
+
+# ──────────────────────────────────────────────────────────────
+# PROCESSAMENTO DE UM ARQUIVO
 # ──────────────────────────────────────────────────────────────
 def process_file(filename: str, content: bytes) -> dict:
     start  = time.time()
     result = {"file": filename, "status": "ok", "rows": 0, "table": "", "elapsed_s": 0, "error": None}
-
     try:
-        # Descompactar gzip se necessário
         real_filename = filename
         raw_content   = content
         if filename.lower().endswith(".gz"):
@@ -428,21 +342,17 @@ def process_file(filename: str, content: bytes) -> dict:
             real_filename = filename[:-3]
             result["file"] = real_filename
 
-        conn = get_conn()
-        try:
-            if real_filename.lower().endswith(".csv"):
-                # CSV: streaming com pd.read_csv(chunksize=N)
-                table, total_rows = stream_csv(raw_content, real_filename, conn)
-            else:
-                # XLSX/XLS: streaming linha por linha com openpyxl read_only
-                table, total_rows = stream_xlsx(raw_content, real_filename, conn)
+        bq = get_bq_client()
+        ensure_bq_dataset(bq)
 
-            result["table"] = table
-            result["rows"]  = total_rows
-        finally:
-            conn.close()
+        if real_filename.lower().endswith(".csv"):
+            table, rows = stream_csv(raw_content, real_filename, bq)
+        else:
+            table, rows = stream_xlsx(raw_content, real_filename, bq)
 
-        del raw_content  # libera RAM
+        result["table"] = table
+        result["rows"]  = rows
+        del raw_content
 
     except Exception:
         result["status"] = "error"
@@ -452,226 +362,76 @@ def process_file(filename: str, content: bytes) -> dict:
     return result
 
 # ──────────────────────────────────────────────────────────────
-# VIEW: BASE ENRIQUECIDA (Pedidos × Produtos × Clientes)
-# Cruza: pedidos.sku → produtos, pedidos.single_id → clientes
+# CLOUD STORAGE — signed URL para upload direto do browser
 # ──────────────────────────────────────────────────────────────
-VIEW_PEDIDOS_ENRIQUECIDA = """
-CREATE OR REPLACE VIEW public.pedidos_enriquecida AS
-SELECT
-  p.id AS pedido_id,
-  p.cod_pedido,
-  p.id_cliente,
-  p.single_id,
-  p.sku,
-  p.valor_item_pedido,
-  p.valor_item_pedido_frete,
-  p.qtd_itens,
-  p.canal_venda,
-  p.bandeira,
-  p.data_pedido,
-  p.cod_tip_frete,
-  p.descricao_tipo_frete,
-  p.data_atualizacao,
-  p.valor_frete,
-  p.flag_retira,
-  p.data_entrega,
-  p.flag_marketplace,
-  p.flag_lista_casamento,
-  p.id_lista_casamento,
-  p.cod_motivo_cancelamento,
-  p.descricao_motivo_cancelamento,
-  p._source_file AS pedido_source_file,
-  p._loaded_at AS pedido_loaded_at,
-  prod.nome_sku AS produto_nome_sku,
-  prod.nome_marca AS produto_marca,
-  prod.nome_setor_gerencial AS produto_setor,
-  prod.nome_categoria_gerencial AS produto_categoria,
-  prod.url_produto AS produto_url,
-  c.nome AS cliente_nome,
-  c.email AS cliente_email,
-  c.cpf AS cliente_cpf,
-  c.telefone AS cliente_telefone,
-  c.data_cadastro AS cliente_data_cadastro
-FROM public.pedidos p
-LEFT JOIN public.produtos prod ON p.sku = prod.sku
-LEFT JOIN public.clientes c ON p.single_id = c.single_id;
-"""
-
-
-@app.post("/setup-enriquecida")
-@app.post("/api/setup_enriquecida")
-def setup_enriquecida():
-    """
-    Cria/atualiza a view pedidos_enriquecida (base final cruzada).
-    Pedidos × Produtos (SKU) × Clientes (single_id).
-    Rode depois de subir as 3 bases.
-    """
-    try:
-        conn = get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(VIEW_PEDIDOS_ENRIQUECIDA)
-            conn.commit()
-            return {"status": "ok", "message": "View public.pedidos_enriquecida criada/atualizada."}
-        finally:
-            conn.close()
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
+def get_gcs_client():
+    creds = _get_gcp_credentials()
+    return storage.Client(project=CONFIG["project_id"], credentials=creds)
 
 # ──────────────────────────────────────────────────────────────
 # ENDPOINTS
 # ──────────────────────────────────────────────────────────────
 
-# ──────────────────────────────────────────────────────────────
-# ENDPOINT ZIP — recebe um .zip e processa arquivo por arquivo
-# sem carregar tudo na RAM de uma vez
-# ──────────────────────────────────────────────────────────────
-@app.post("/upload-zip")
-async def upload_zip(
-    file: UploadFile = File(...),
-    replace_pedidos: bool = Form(False),
-):
-    """
-    Recebe um único arquivo .zip contendo vários XLSX/CSV.
-    Extrai e processa cada arquivo individualmente para economizar RAM.
-    Ideal para lotes grandes (ex.: 32 arquivos × 22 MB = 660 MB).
-    """
-    if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(400, "Envie um arquivo .zip.")
-
-    raw_zip = await file.read()
-
-    # Verificar se é zip válido
-    if not zipfile.is_zipfile(io.BytesIO(raw_zip)):
-        raise HTTPException(400, "Arquivo não é um ZIP válido.")
-
-    if replace_pedidos:
-        try:
-            conn = get_conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("TRUNCATE TABLE public.pedidos RESTART IDENTITY CASCADE")
-                conn.commit()
-            finally:
-                conn.close()
-        except Exception as e:
-            raise HTTPException(500, f"Erro ao limpar pedidos: {e}")
-
-    results = []
-    with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
-        names = [
-            n for n in zf.namelist()
-            if not n.startswith("__MACOSX")        # ignora metadata do Mac
-            and not os.path.basename(n).startswith(".")  # ignora arquivos ocultos
-            and n.lower().endswith((".xlsx", ".xls", ".csv"))
-        ]
-
-        if not names:
-            raise HTTPException(400, "Nenhum arquivo XLSX/CSV encontrado dentro do ZIP.")
-
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor(max_workers=CONFIG["max_workers"]) as pool:
-            tasks = []
-            for name in names:
-                content_bytes = zf.read(name)
-                # Usa apenas o nome do arquivo, sem pastas internas
-                filename = os.path.basename(name)
-                tasks.append(
-                    loop.run_in_executor(pool, process_file, filename, content_bytes)
-                )
-            results = list(await asyncio.gather(*tasks))
-
-    ok    = [r for r in results if r["status"] == "ok"]
-    error = [r for r in results if r["status"] != "ok"]
-    return {
-        "total":   len(results),
-        "success": len(ok),
-        "failed":  len(error),
-        "results": results,
-    }
-
-
-# ──────────────────────────────────────────────────────────────
-# STORAGE: gera URL assinada para upload direto do browser
-# O browser faz PUT direto no Supabase Storage (sem passar pelo Railway)
-# ──────────────────────────────────────────────────────────────
 @app.post("/storage-token")
 async def storage_token(body: dict):
     """
-    Retorna uma signed URL para o browser fazer PUT direto no Supabase Storage.
-    Body: { "filename": "dados.zip" }
+    Gera signed URL para o browser fazer upload direto no GCS.
+    Se unique=True (ou para arquivos soltos), usa path único: uploads/YYYY-MM-DD/{uuid}_{filename}.
     """
     filename = body.get("filename", "upload.zip")
-    path     = f"uploads/{filename}"
-    url      = f"{STORAGE['url']}/storage/v1/object/{STORAGE['bucket']}/{path}"
-    headers  = {
-        "Authorization": f"Bearer {STORAGE['key']}",
-        "Content-Type":  "application/json",
-    }
-    # Cria signed URL de upload (válida por 1 hora)
-    sign_url = f"{STORAGE['url']}/storage/v1/object/sign/{STORAGE['bucket']}/{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(sign_url, headers=headers, json={"expiresIn": 3600})
-    if r.status_code not in (200, 201):
-        raise HTTPException(500, f"Erro ao gerar signed URL: {r.text}")
-    data = r.json()
-    signed_url = data.get("signedURL") or data.get("signedUrl") or data.get("url")
-    if not signed_url:
-        raise HTTPException(500, f"Resposta inesperada do Storage: {data}")
-    # Prefixar com a URL base se vier relativo
-    if signed_url.startswith("/"):
-        signed_url = STORAGE["url"] + signed_url
+    unique   = body.get("unique", False)
+    safe     = re.sub(r"[^a-zA-Z0-9._-]", "_", filename)
+    if unique:
+        path = f"uploads/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4().hex}_{safe}"
+    else:
+        path = f"uploads/{safe}"
+    gcs   = get_gcs_client()
+    bucket = gcs.bucket(CONFIG["bucket"])
+    blob  = bucket.blob(path)
+    signed_url = blob.generate_signed_url(
+        version      = "v4",
+        expiration   = 3600,
+        method       = "PUT",
+        content_type = body.get("content_type") or "application/octet-stream",
+    )
     return {"upload_url": signed_url, "path": path}
 
 
-# ──────────────────────────────────────────────────────────────
-# PROCESS-STORAGE: Railway baixa o ZIP do Storage e processa
-# Chamado pelo browser APÓS o upload para o Storage concluir
-# ──────────────────────────────────────────────────────────────
 @app.post("/process-storage")
 async def process_storage(body: dict):
     """
-    Baixa o ZIP do Supabase Storage e processa arquivo por arquivo.
-    Body: { "path": "uploads/dados.zip", "replace_pedidos": false }
+    Baixa o ZIP do GCS em streaming para arquivo temporário,
+    extrai e processa cada arquivo individualmente no BigQuery.
     """
     path            = body.get("path", "")
     replace_pedidos = body.get("replace_pedidos", False)
-
     if not path:
         raise HTTPException(400, "Campo 'path' obrigatório.")
 
-    # ── Baixar o ZIP do Storage em streaming para arquivo temporário ──
-    download_url = f"{STORAGE['url']}/storage/v1/object/{STORAGE['bucket']}/{path}"
-    headers      = {"Authorization": f"Bearer {STORAGE['key']}"}
+    gcs    = get_gcs_client()
+    bucket = gcs.bucket(CONFIG["bucket"])
+    blob   = bucket.blob(path)
+
+    # Truncar pedidos antes se solicitado
+    if replace_pedidos:
+        bq      = get_bq_client()
+        full_id = f"{CONFIG['project_id']}.{CONFIG['dataset']}.pedidos"
+        try:
+            bq.delete_table(full_id)
+        except Exception:
+            pass  # tabela pode não existir ainda
 
     tmp_path = None
+    results  = []
     try:
+        # Download streaming para disco temporário
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
             tmp_path = tmp.name
-            async with httpx.AsyncClient(timeout=600) as client:
-                async with client.stream("GET", download_url, headers=headers) as resp:
-                    if resp.status_code != 200:
-                        raise HTTPException(500, f"Erro ao baixar do Storage: {resp.status_code}")
-                    async for chunk in resp.aiter_bytes(chunk_size=8 * 1024 * 1024):  # 8 MB chunks
-                        tmp.write(chunk)
+            blob.download_to_file(tmp)
 
-        # ── Verificar ZIP ──
         if not zipfile.is_zipfile(tmp_path):
             raise HTTPException(400, "Arquivo no Storage não é um ZIP válido.")
 
-        # ── Truncar pedidos se solicitado ──
-        if replace_pedidos:
-            conn = get_conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("TRUNCATE TABLE public.pedidos RESTART IDENTITY CASCADE")
-                conn.commit()
-            finally:
-                conn.close()
-
-        # ── Processar arquivo por arquivo dentro do ZIP ──
-        results = []
         with zipfile.ZipFile(tmp_path) as zf:
             names = [
                 n for n in zf.namelist()
@@ -682,49 +442,114 @@ async def process_storage(body: dict):
             if not names:
                 raise HTTPException(400, "Nenhum XLSX/CSV encontrado no ZIP.")
 
-            # Processar sequencialmente para economizar RAM (14 GB = cuidado)
             for name in names:
                 filename      = os.path.basename(name)
                 content_bytes = zf.read(name)
                 result        = process_file(filename, content_bytes)
                 results.append(result)
-                del content_bytes  # liberar RAM imediatamente
+                del content_bytes  # libera RAM
 
     finally:
-        # Remover arquivo temporário sempre
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
     ok    = [r for r in results if r["status"] == "ok"]
     error = [r for r in results if r["status"] != "ok"]
-    return {
-        "total":   len(results),
-        "success": len(ok),
-        "failed":  len(error),
-        "results": results,
-    }
+    return {"total": len(results), "success": len(ok), "failed": len(error), "results": results}
+
+
+@app.post("/load-from-gcs")
+async def load_from_gcs(body: dict):
+    """
+    Carrega um arquivo CSV já no GCS direto no BigQuery (load job).
+    O Railway NÃO baixa o arquivo — evita timeout e 502 para arquivos grandes.
+    """
+    path            = body.get("path", "").strip()
+    table_type      = (body.get("table_type") or "generico").strip().lower()
+    replace_pedidos = body.get("replace_pedidos", False)
+    if not path:
+        raise HTTPException(400, "Campo 'path' obrigatório.")
+    if table_type not in ("pedidos", "produtos", "clientes", "generico"):
+        table_type = "generico"
+
+    gcs_uri = f"gs://{CONFIG['bucket']}/{path}"
+    bq      = get_bq_client()
+    ensure_bq_dataset(bq)
+    table_id = f"{CONFIG['project_id']}.{CONFIG['dataset']}.{table_type}"
+
+    job_config = bigquery.LoadJobConfig(
+        source_format       = bigquery.SourceFormat.CSV,
+        autodetect          = True,
+        skip_leading_rows   = 1,
+        write_disposition   = bigquery.WriteDisposition.WRITE_TRUNCATE
+        if (table_type == "pedidos" and replace_pedidos)
+        else bigquery.WriteDisposition.WRITE_APPEND,
+    )
+    load_job = bq.load_table_from_uri(gcs_uri, table_id, job_config=job_config)
+    try:
+        load_job.result(timeout=600)
+        rows = load_job.output_rows or 0
+        return {"status": "ok", "rows": rows, "table": table_type}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "table": table_type}
+
+
+@app.post("/setup-enriquecida")
+async def setup_enriquecida():
+    """Cria/atualiza view pedidos_enriquecida no BigQuery."""
+    try:
+        bq  = get_bq_client()
+        ds  = CONFIG["dataset"]
+        pid = CONFIG["project_id"]
+        sql = f"""
+        CREATE OR REPLACE VIEW `{pid}.{ds}.pedidos_enriquecida` AS
+        SELECT
+          p.* EXCEPT (_source_file, _loaded_at),
+          p._source_file AS pedido_source_file,
+          p._loaded_at   AS pedido_loaded_at,
+          prod.nome_sku, prod.nome_marca, prod.nome_setor_gerencial,
+          prod.nome_categoria_gerencial, prod.url_produto,
+          c.nome AS cliente_nome, c.email AS cliente_email,
+          c.cpf  AS cliente_cpf,  c.telefone AS cliente_telefone
+        FROM `{pid}.{ds}.pedidos` p
+        LEFT JOIN `{pid}.{ds}.produtos` prod ON CAST(p.sku AS INT64) = prod.sku
+        LEFT JOIN `{pid}.{ds}.clientes` c    ON p.single_id = c.single_id
+        """
+        bq.query(sql).result()
+        return {"status": "ok", "message": f"View {ds}.pedidos_enriquecida criada/atualizada."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 
 @app.get("/health")
-@app.get("/api/health")
-def health():
+async def health():
+    diag = {"status": "ok", "gcp_project": CONFIG["project_id"],
+            "bucket": CONFIG["bucket"], "dataset": CONFIG["dataset"]}
     try:
-        conn = get_conn()
-        conn.close()
-        db_ok = True
+        bq = get_bq_client()
+        list(bq.list_datasets(max_results=1))
+        diag["bq_connected"] = True
     except Exception as e:
-        db_ok = str(e)
-    return {"status": "ok", "db_connected": db_ok}
+        diag["bq_connected"] = False
+        diag["bq_error"]     = str(e)
+        diag["status"]       = "error"
+    try:
+        gcs = get_gcs_client()
+        gcs.get_bucket(CONFIG["bucket"])
+        diag["gcs_connected"] = True
+    except Exception as e:
+        diag["gcs_connected"] = False
+        diag["gcs_error"]     = str(e)
+        diag["status"]        = "error"
+    return diag
 
 
-from fastapi.responses import HTMLResponse
-
-# HTML embutido diretamente — funciona em qualquer ambiente (Vercel, Railway, local)
 _HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Supabase Bulk Uploader</title>
+  <title>GCP Bulk Uploader</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
   <style>
@@ -736,8 +561,8 @@ _HTML = """<!DOCTYPE html>
       background-image:linear-gradient(rgba(62,207,142,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(62,207,142,.03) 1px,transparent 1px);
       background-size:40px 40px}
     .z1{position:relative;z-index:1}
-    #drop-zone{border:2px dashed var(--border);border-radius:16px;transition:border-color .2s,background .2s;cursor:pointer}
-    #drop-zone.over{border-color:var(--accent);background:rgba(62,207,142,.04)}
+    #drop-zone,#csv-drop-zone{border:2px dashed var(--border);border-radius:16px;transition:border-color .2s,background .2s;cursor:pointer}
+    #drop-zone.over,#csv-drop-zone.over{border-color:var(--accent);background:rgba(62,207,142,.04)}
     .bar-wrap{height:4px;background:var(--border);border-radius:99px;overflow:hidden}
     .bar-fill{height:100%;background:var(--accent);border-radius:99px;transition:width .3s ease}
     .step-badge{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;font-size:11px;font-weight:700;flex-shrink:0}
@@ -774,18 +599,57 @@ _HTML = """<!DOCTYPE html>
         <path d="M4 7h16M4 12h10M4 17h7"/>
         <circle cx="19" cy="17" r="3"/><path d="m21 19-1.5-1.5"/>
       </svg>
-      <h1 class="text-xl font-semibold tracking-tight">Supabase Bulk Uploader</h1>
-      <span class="mono text-xs px-2 py-0.5 rounded border" style="border-color:#1d6648;color:#3ecf8e;background:rgba(62,207,142,.07)">v4.0</span>
+      <h1 class="text-xl font-semibold tracking-tight">GCP Bulk Uploader</h1>
+      <span class="mono text-xs px-2 py-0.5 rounded border" style="border-color:#1d6648;color:#3ecf8e;background:rgba(62,207,142,.07)">v5.0</span>
     </div>
     <p class="text-sm" style="color:var(--muted)">
-      Upload de <strong style="color:var(--text)">ZIPs grandes</strong> direto no Supabase Storage —
-      detecção automática (<span style="color:#93c5fd">pedidos</span> /
-      <span style="color:#fbbf24">produtos</span> /
-      <span style="color:#c4b5fd">clientes</span>).
+      Upload direto no GCP Storage e BigQuery — detecção automática
+      (<span style="color:#93c5fd">pedidos</span> / <span style="color:#fbbf24">produtos</span> / <span style="color:#c4b5fd">clientes</span>).
     </p>
   </div>
 
-  <!-- ETAPAS -->
+  <!-- RECOMENDADO: CSVs soltos (Railway não baixa — sem timeout) -->
+  <div class="z1 w-full max-w-2xl mb-8 p-5 rounded-xl border-2" style="background:rgba(62,207,142,.06);border-color:var(--accent)">
+    <p class="text-sm font-semibold mb-1" style="color:var(--accent)">Recomendado para muitos GB</p>
+    <p class="text-sm mb-4" style="color:var(--muted)">
+      Envie <strong style="color:var(--text)">CSVs soltos</strong>. Cada arquivo vai direto para o Storage e o BigQuery carrega de lá — o Railway não baixa nada, evita congelamento e 502.
+    </p>
+    <div id="csv-drop-zone" class="w-full py-10 flex flex-col items-center gap-3 mb-4 rounded-xl border-2 border-dashed cursor-pointer transition"
+         style="border-color:var(--border)" onclick="document.getElementById('csv-file-input').click()">
+      <input type="file" id="csv-file-input" accept=".csv" multiple class="hidden" />
+      <p class="font-medium">Arraste CSVs aqui ou clique</p>
+      <p id="csv-file-count" class="text-sm" style="color:var(--muted)">0 arquivos</p>
+    </div>
+    <div class="flex items-center gap-2 mb-4">
+      <input type="checkbox" id="csv-replace-pedidos" style="accent-color:var(--accent);width:16px;height:16px" />
+      <label for="csv-replace-pedidos" class="text-sm">Substituir pedidos (troca diária)</label>
+    </div>
+    <button id="csv-send-btn" class="btn mb-4" disabled onclick="startCsvUpload()">Enviar CSVs para BigQuery</button>
+    <div id="csv-prog-sec" class="mb-4 hidden">
+      <div class="flex justify-between text-xs mb-2" style="color:var(--muted)">
+        <span id="csv-prog-label" class="pulse">Enviando…</span>
+        <span id="csv-prog-pct" class="mono">0%</span>
+      </div>
+      <div class="bar-wrap"><div id="csv-prog-fill" class="bar-fill" style="width:0%"></div></div>
+    </div>
+    <div id="csv-summary" class="mb-4 hidden">
+      <div class="grid grid-cols-3 gap-3">
+        <div class="stat"><p class="mono text-xl font-semibold" id="csv-s-total">0</p><p class="text-xs" style="color:var(--muted)">Arquivos</p></div>
+        <div class="stat" style="border-color:rgba(62,207,142,.3)"><p class="mono text-xl font-semibold" id="csv-s-ok" style="color:var(--accent)">0</p><p class="text-xs" style="color:var(--muted)">Sucesso</p></div>
+        <div class="stat" style="border-color:rgba(248,113,113,.3)"><p class="mono text-xl font-semibold text-red-400" id="csv-s-err">0</p><p class="text-xs" style="color:var(--muted)">Falhas</p></div>
+      </div>
+    </div>
+    <div id="csv-results-sec" class="hidden"><p class="mono text-xs uppercase mb-2" style="color:var(--muted)">Detalhe</p><div id="csv-results-list" class="scroll flex flex-col gap-2"></div></div>
+  </div>
+
+  <!-- Divisor: ou use ZIP -->
+  <div class="z1 w-full max-w-2xl mb-4 flex items-center gap-3">
+    <div class="flex-1 h-px" style="background:var(--border)"></div>
+    <span class="text-xs" style="color:var(--muted)">Ou use um ZIP (pode dar timeout se &gt; 200 MB)</span>
+    <div class="flex-1 h-px" style="background:var(--border)"></div>
+  </div>
+
+  <!-- ETAPAS (ZIP) -->
   <div class="z1 w-full max-w-2xl mb-6 flex gap-2 items-center">
     <div class="flex items-center gap-2">
       <span id="step1-badge" class="step-badge step-active">1</span>
@@ -813,7 +677,7 @@ _HTML = """<!DOCTYPE html>
     </svg>
     <div class="text-center">
       <p class="font-medium mb-1">Arraste o <span style="color:var(--accent)">.zip</span> aqui</p>
-      <p class="text-sm" style="color:var(--muted)">Qualquer tamanho — sobe direto no Supabase Storage</p>
+      <p class="text-sm" style="color:var(--muted)">ZIPs pequenos (&lt; 200 MB). Para muitos GB use CSVs soltos acima.</p>
     </div>
     <!-- Info do arquivo selecionado -->
     <div id="zip-info" class="hidden flex items-center gap-3 px-4 py-2 rounded-lg border" style="border-color:var(--accent);background:rgba(62,207,142,.06)">
@@ -895,8 +759,105 @@ _HTML = """<!DOCTYPE html>
 <script>
 const TABLE_COLORS = {pedidos:'type-pedidos',produtos:'type-produtos',clientes:'type-clientes',generico:'type-generico'};
 let selectedZip = null;
+let csvFiles = [];
 
-// ── DRAG & DROP ──
+function guessType(name) {
+  const n = (name||'').toLowerCase();
+  if (/pedido|order/i.test(n)) return 'pedidos';
+  if (/sku|produto|product/i.test(n)) return 'produtos';
+  if (/cliente|customer/i.test(n)) return 'clientes';
+  return 'generico';
+}
+
+// ── CSVs soltos ──
+function initCsvDropZone() {
+  const dz = document.getElementById('csv-drop-zone');
+  const input = document.getElementById('csv-file-input');
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('over'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('over'));
+  dz.addEventListener('drop', e => {
+    e.preventDefault(); dz.classList.remove('over');
+    const files = [...e.dataTransfer.files].filter(f => f.name.toLowerCase().endsWith('.csv'));
+    addCsvFiles(files);
+  });
+  input.addEventListener('change', e => { addCsvFiles([...e.target.files]); e.target.value = ''; });
+}
+function addCsvFiles(files) {
+  for (const f of files) {
+    if (csvFiles.length >= 100) break;
+    if (!csvFiles.some(x => x.name === f.name)) csvFiles.push(f);
+  }
+  document.getElementById('csv-file-count').textContent = csvFiles.length + ' arquivo(s)';
+  document.getElementById('csv-send-btn').disabled = csvFiles.length === 0;
+}
+async function startCsvUpload() {
+  if (csvFiles.length === 0) return;
+  const btn = document.getElementById('csv-send-btn');
+  const replacePedidos = document.getElementById('csv-replace-pedidos').checked;
+  btn.disabled = true;
+  document.getElementById('csv-prog-sec').classList.remove('hidden');
+  document.getElementById('csv-summary').classList.add('hidden');
+  document.getElementById('csv-results-sec').classList.add('hidden');
+  const results = [];
+  const total = csvFiles.length;
+  let firstPedidosDone = false;
+  for (let i = 0; i < csvFiles.length; i++) {
+    const file = csvFiles[i];
+    const tableType = guessType(file.name);
+    const pct = Math.round((i / total) * 100);
+    document.getElementById('csv-prog-fill').style.width = pct + '%';
+    document.getElementById('csv-prog-pct').textContent = pct + '%';
+    document.getElementById('csv-prog-label').textContent = 'Enviando ' + (i+1) + '/' + total + ': ' + file.name + ' para GCS…';
+    document.getElementById('csv-prog-label').classList.add('pulse');
+    try {
+      const tokenRes = await fetch(window.location.origin + '/storage-token', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ filename: file.name, unique: true, content_type: 'text/csv' })
+      });
+      if (!tokenRes.ok) throw new Error('URL: ' + await tokenRes.text());
+      const { upload_url, path } = await tokenRes.json();
+      const putRes = await fetch(upload_url, { method: 'PUT', body: file, headers: { 'Content-Type': 'text/csv' } });
+      if (!putRes.ok) throw new Error('GCS PUT ' + putRes.status);
+      document.getElementById('csv-prog-label').textContent = 'Carregando no BigQuery: ' + file.name + '…';
+      const loadRes = await fetch(window.location.origin + '/load-from-gcs', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          path,
+          table_type: tableType,
+          replace_pedidos: replacePedidos && tableType === 'pedidos' && !firstPedidosDone
+        })
+      });
+      const loadData = await loadRes.json();
+      if (loadData.status === 'ok' && tableType === 'pedidos') firstPedidosDone = true;
+      results.push({ file: file.name, status: loadData.status === 'ok' ? 'ok' : 'error', table: tableType, rows: loadData.rows || 0, error: loadData.message });
+    } catch (err) {
+      results.push({ file: file.name, status: 'error', table: guessType(file.name), error: err.message });
+    }
+  }
+  document.getElementById('csv-prog-fill').style.width = '100%';
+  document.getElementById('csv-prog-pct').textContent = '100%';
+  document.getElementById('csv-prog-label').textContent = 'Concluído.';
+  document.getElementById('csv-prog-label').classList.remove('pulse');
+  document.getElementById('csv-s-total').textContent = results.length;
+  document.getElementById('csv-s-ok').textContent = results.filter(r => r.status === 'ok').length;
+  document.getElementById('csv-s-err').textContent = results.filter(r => r.status !== 'ok').length;
+  document.getElementById('csv-summary').classList.remove('hidden');
+  const list = document.getElementById('csv-results-list');
+  list.innerHTML = '';
+  results.forEach(r => {
+    const tc = TABLE_COLORS[r.table] || 'type-generico';
+    const badge = r.status === 'ok' ? '<span class="badge b-ok">OK</span>' : '<span class="badge b-err">ERRO</span>';
+    const row = document.createElement('div');
+    row.className = 'res-row';
+    row.innerHTML = `<span class="truncate text-sm">${r.file}</span><span class="type-badge ${tc}">${r.table}</span>${r.rows ? '<span class="mono text-xs" style="color:var(--muted)">' + r.rows.toLocaleString('pt-BR') + ' linhas</span>' : ''}${badge}`;
+    if (r.error) { const pre = document.createElement('pre'); pre.style.cssText = 'font-size:11px;color:var(--red);margin-top:4px'; pre.textContent = r.error; row.appendChild(pre); }
+    list.appendChild(row);
+  });
+  document.getElementById('csv-results-sec').classList.remove('hidden');
+  btn.disabled = false;
+}
+
+// ── DRAG & DROP (ZIP) ──
 const zone = document.getElementById('drop-zone');
 zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('over'); });
 zone.addEventListener('dragleave', () => zone.classList.remove('over'));
@@ -1085,6 +1046,7 @@ async function setupEnriquecida() {
     el.textContent = '✗ ' + err.message; el.style.color = 'var(--red)';
   }
 }
+document.addEventListener('DOMContentLoaded', initCsvDropZone);
 </script>
 </body>
 </html>"""
