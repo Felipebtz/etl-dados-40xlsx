@@ -289,8 +289,8 @@ async function compressFile(file) {
   return new File([compressedBlob], file.name + '.gz', { type: 'application/gzip' });
 }
 
-// ── UPLOAD (lotes pequenos; opção sem comprimir para arquivos grandes) ──
-const BATCH_SIZE = 3;  // poucos arquivos por vez para evitar limite e erro de compressão
+// ── UPLOAD (1 arquivo por requisição para evitar 413 Payload Too Large na Vercel) ──
+const BATCH_SIZE = 1;
 
 async function startUpload() {
   const btn = document.getElementById('upload-btn');
