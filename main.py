@@ -27,8 +27,12 @@ MAX_DB_RETRIES = 3
 RETRY_DELAY_SEC = 1
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+
+# Railway Pro: limite alto por parte (2 GB) para arquivos grandes; Vercel continua com default
+MAX_UPLOAD_PART_MB = int(os.getenv("MAX_UPLOAD_PART_MB", "2048"))  # 2 GB default para Railway
+MAX_UPLOAD_PART_BYTES = MAX_UPLOAD_PART_MB * 1024 * 1024
 
 app = FastAPI(title="Supabase Bulk Uploader", version="2.0.0")
 
@@ -400,19 +404,19 @@ def setup_enriquecida():
 # ENDPOINTS
 # ──────────────────────────────────────────────────────────────
 @app.post("/upload")
-async def upload_files(
-    files: list[UploadFile] = File(...),
-    replace_pedidos: bool = Form(False),
-):
+async def upload_files(request: Request):
     """
-    Upload em lote. Opcional: replace_pedidos=true para troca diária
-    (apaga pedidos antes de inserir os novos).
+    Upload em lote. Railway Pro: aceita arquivos grandes (max_part_size configurável).
+    Form: files (múltiplos), replace_pedidos (opcional).
     """
-    if not files:
+    form = await request.form(max_part_size=MAX_UPLOAD_PART_BYTES)
+    files_list = form.getlist("files")
+    if not files_list:
         raise HTTPException(400, "Nenhum arquivo enviado.")
-    if len(files) > 40:
+    if len(files_list) > 40:
         raise HTTPException(400, "Máximo de 40 arquivos por vez.")
 
+    replace_pedidos = (form.get("replace_pedidos") or "").lower() == "true"
     if replace_pedidos:
         try:
             conn = get_conn()
@@ -425,7 +429,7 @@ async def upload_files(
         except Exception as e:
             raise HTTPException(500, f"Erro ao limpar pedidos: {e}")
 
-    file_data = [(f.filename, await f.read()) for f in files]
+    file_data = [(f.filename, await f.read()) for f in files_list]
 
     loop = asyncio.get_event_loop()
     with ThreadPoolExecutor(max_workers=CONFIG["max_workers"]) as pool:
