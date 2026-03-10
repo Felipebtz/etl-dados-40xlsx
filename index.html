@@ -295,10 +295,11 @@ async function compressFile(file) {
   return new File([compressedBlob], file.name + '.gz', { type: 'application/gzip' });
 }
 
-// ── UPLOAD: Railway Pro = sem limite por arquivo; Vercel = bloqueia > 4.5 MB ──
+// ── UPLOAD: Só na Vercel bloqueia > 4.5 MB; Railway/Render/outros = sem limite no front ──
 const BATCH_SIZE = 1;
 const VERCEL_MAX_BODY_MB = 4.5;
 function isRailway() { return window.location.hostname.includes('railway.app'); }
+function isVercel() { return window.location.hostname.includes('vercel.app'); }
 
 async function startUpload() {
   const btn = document.getElementById('upload-btn');
@@ -307,7 +308,8 @@ async function startUpload() {
   ps.classList.remove('hidden');
   label.classList.add('pulse');
 
-  if (!isRailway()) {
+  // Bloqueio de tamanho apenas na Vercel; no Railway e outros hosts não bloqueia
+  if (isVercel()) {
     const maxBytes = VERCEL_MAX_BODY_MB * 1024 * 1024;
     const tooLarge = selectedFiles.filter(f => f.size > maxBytes);
     if (tooLarge.length > 0) {
@@ -366,7 +368,13 @@ async function startUpload() {
       setProgress(20 + Math.round((i / filesToSend.length) * 75));
 
       const res = await fetch(url, { method: 'POST', body: form });
-      if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
+      if (!res.ok) {
+        const body = await res.text();
+        if (res.status === 502 && isRailway()) {
+          throw new Error('HTTP 502: tempo esgotado (arquivo muito grande ou muitos arquivos). Tente enviar 1 arquivo por vez e use "Enviar sem comprimir".');
+        }
+        throw new Error('HTTP ' + res.status + ': ' + body);
+      }
       const data = await res.json();
       allResults.push(...data.results);
     }

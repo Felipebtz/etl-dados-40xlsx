@@ -103,6 +103,13 @@ Assim o upload (POST /upload) grava nas tabelas **pedidos**, **produtos**, **cli
 
 ---
 
-## 9. Limite de upload no Railway
+## 9. Limite de upload e HTTP 502 (timeout)
 
-No plano pago o limite de request body é bem maior que na Vercel. Arquivos grandes (dezenas de MB) costumam funcionar; se precisar de mais, dá para aumentar no FastAPI depois.
+No plano pago o limite de request body é bem maior que na Vercel. Arquivos grandes (dezenas de MB) costumam funcionar; no código já está configurado até 2 GB por arquivo (`MAX_UPLOAD_PART_MB`).
+
+**Se aparecer HTTP 502 ("Application failed to respond"):** o proxy do Railway encerrou a requisição por tempo. Isso é comum com arquivos de centenas de MB ou GB.
+
+- Envie **um arquivo por vez** (o front já usa lotes de 1; evite muitos na fila).
+- Use **"Enviar sem comprimir"** para arquivos muito grandes (evita timeout na compressão no navegador).
+- No Railway, em **Settings** do service, veja se há opção de **request timeout** e aumente se existir.
+- Para arquivos de 2 GB+, o processamento pode levar vários minutos; 502 pode ser limite do gateway — nesse caso reduzir tamanho por arquivo (ex.: particionar em partes menores) ou processar em outro ambiente com timeout maior.

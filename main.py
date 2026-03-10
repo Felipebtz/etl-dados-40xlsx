@@ -405,45 +405,6 @@ def setup_enriquecida():
 # ──────────────────────────────────────────────────────────────
 # ENDPOINTS
 # ──────────────────────────────────────────────────────────────
-@app.post("/upload")
-@app.post("/api/upload")  # mesma rota para Vercel (api/upload.py) e local
-async def upload_files(
-    files: list[UploadFile] = File(...),
-    replace_pedidos: bool = Form(False),
-):
-    """
-    Upload em lote. Opcional: replace_pedidos=true para troca diária
-    (apaga pedidos antes de inserir os novos).
-    """
-    if not files:
-        raise HTTPException(400, "Nenhum arquivo enviado.")
-    if len(files) > 40:
-        raise HTTPException(400, "Máximo de 40 arquivos por vez.")
-
-    if replace_pedidos:
-        try:
-            conn = get_conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute('TRUNCATE TABLE public.pedidos RESTART IDENTITY CASCADE')
-                conn.commit()
-            finally:
-                conn.close()
-        except Exception as e:
-            raise HTTPException(500, f"Erro ao limpar pedidos: {e}")
-
-    file_data = [(f.filename, await f.read()) for f in files]
-
-    loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor(max_workers=CONFIG["max_workers"]) as pool:
-        tasks = [loop.run_in_executor(pool, process_file, fn, ct) for fn, ct in file_data]
-        results = await asyncio.gather(*tasks)
-
-    ok = [r for r in results if r["status"] == "ok"]
-    error = [r for r in results if r["status"] != "ok"]
-    return {"total": len(results), "success": len(ok), "failed": len(error), "results": list(results)}
-
-
 
 # ──────────────────────────────────────────────────────────────
 # ENDPOINT ZIP — recebe um .zip e processa arquivo por arquivo
@@ -541,8 +502,7 @@ _HTML = """<!DOCTYPE html>
       --bg:     #0d0d12;
       --panel:  #13131a;
       --border: #1e2030;
-      --accent: #3ecf8e;   /* verde Supabase */
-      --accent2:#1d6648;
+      --accent: #3ecf8e;
       --red:    #f87171;
       --muted:  #52526e;
       --text:   #e0e0f0;
@@ -550,83 +510,51 @@ _HTML = """<!DOCTYPE html>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: var(--bg); font-family: 'IBM Plex Sans', sans-serif; color: var(--text); min-height: 100vh; }
     .mono { font-family: 'IBM Plex Mono', monospace; }
-
-    /* ─── GRID BG ─── */
     body::before {
-      content: '';
-      position: fixed; inset: 0; pointer-events: none; z-index: 0;
-      background-image:
-        linear-gradient(rgba(62,207,142,.03) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(62,207,142,.03) 1px, transparent 1px);
+      content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+      background-image: linear-gradient(rgba(62,207,142,.03) 1px, transparent 1px), linear-gradient(90deg, rgba(62,207,142,.03) 1px, transparent 1px);
       background-size: 40px 40px;
     }
     .z1 { position: relative; z-index: 1; }
 
-    /* ─── DROP ZONE ─── */
+    /* DROP ZONE */
     #drop-zone {
-      border: 1.5px dashed var(--border);
-      border-radius: 14px;
-      transition: border-color .2s, background .2s;
-      cursor: pointer;
+      border: 2px dashed var(--border); border-radius: 16px;
+      transition: border-color .2s, background .2s; cursor: pointer;
     }
-    #drop-zone.over {
-      border-color: var(--accent);
-      background: rgba(62,207,142,.04);
-    }
-    #file-input { display: none; }
+    #drop-zone.over { border-color: var(--accent); background: rgba(62,207,142,.04); }
 
-    /* ─── CHIP ─── */
-    .chip {
-      display: flex; align-items: center; gap: 8px;
-      background: var(--panel); border: 1px solid var(--border);
-      border-radius: 8px; padding: 6px 10px; font-size: 12px;
-      animation: up .15s ease;
-    }
-    .chip .x { margin-left: auto; cursor: pointer; color: var(--muted); transition: color .15s; flex-shrink:0; }
-    .chip .x:hover { color: var(--red); }
+    /* PROGRESS */
+    .bar-wrap { height: 4px; background: var(--border); border-radius: 99px; overflow: hidden; }
+    .bar-fill  { height: 100%; background: var(--accent); border-radius: 99px; transition: width .3s ease; }
 
-    /* ─── TABLE TYPE BADGE ─── */
-    .type-badge {
-      font-size: 10px; font-weight: 600; padding: 1px 7px;
-      border-radius: 99px; flex-shrink: 0;
-    }
-    .type-pedidos  { background: rgba(59,130,246,.15); color: #93c5fd; }
-    .type-produtos { background: rgba(251,191,36,.12);  color: #fbbf24; }
-    .type-clientes { background: rgba(167,139,250,.12); color: #c4b5fd; }
-    .type-generico { background: rgba(107,114,128,.12); color: #9ca3af; }
-
-    /* ─── PROGRESS ─── */
-    .bar-wrap { height: 3px; background: var(--border); border-radius: 99px; overflow: hidden; }
-    .bar-fill  { height: 100%; background: var(--accent); border-radius: 99px; transition: width .4s ease; }
-
-    /* ─── RESULT ROW ─── */
+    /* RESULT ROW */
     .res-row {
       display: grid; grid-template-columns: 1fr auto auto auto;
-      gap: 8px; align-items: center;
-      padding: 8px 12px; border-radius: 8px;
-      background: var(--panel); border: 1px solid var(--border);
-      font-size: 13px; animation: up .2s ease;
+      gap: 8px; align-items: center; padding: 8px 12px; border-radius: 8px;
+      background: var(--panel); border: 1px solid var(--border); font-size: 13px;
+      animation: up .2s ease;
     }
     .badge { padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; }
     .b-ok  { background: rgba(62,207,142,.12); color: var(--accent); }
     .b-err { background: rgba(248,113,113,.12); color: var(--red); }
-
-    /* ─── STAT CARD ─── */
+    .type-badge { font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 99px; flex-shrink: 0; }
+    .type-pedidos  { background: rgba(59,130,246,.15); color: #93c5fd; }
+    .type-produtos { background: rgba(251,191,36,.12);  color: #fbbf24; }
+    .type-clientes { background: rgba(167,139,250,.12); color: #c4b5fd; }
+    .type-generico { background: rgba(107,114,128,.12); color: #9ca3af; }
     .stat { padding: 18px; border-radius: 12px; text-align: center; border: 1px solid var(--border); background: var(--panel); }
-
-    .scroll { max-height: 260px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+    .scroll { max-height: 320px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
     .scroll::-webkit-scrollbar { width: 4px; }
     .scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-
     @keyframes up { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:translateY(0); } }
-
-    .btn-primary {
-      background: var(--accent); color: #041f12; font-weight: 600;
-      border-radius: 10px; padding: 12px 0; width: 100%; font-size: 14px;
-      transition: opacity .15s, transform .1s; cursor: pointer; border: none;
+    .btn {
+      background: var(--accent); color: #041f12; font-weight: 600; border-radius: 10px;
+      padding: 12px 24px; font-size: 14px; border: none; cursor: pointer;
+      transition: opacity .15s, transform .1s;
     }
-    .btn-primary:hover:not(:disabled) { opacity: .9; transform: translateY(-1px); }
-    .btn-primary:disabled { opacity: .35; cursor: not-allowed; transform: none; }
+    .btn:hover:not(:disabled) { opacity: .88; transform: translateY(-1px); }
+    .btn:disabled { opacity: .35; cursor: not-allowed; transform: none; }
     .pulse { animation: pulse 1.1s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
   </style>
@@ -634,7 +562,7 @@ _HTML = """<!DOCTYPE html>
 <body class="flex flex-col items-center py-14 px-4">
 
   <!-- HEADER -->
-  <div class="z1 w-full max-w-3xl mb-8">
+  <div class="z1 w-full max-w-2xl mb-10">
     <div class="flex items-center gap-3 mb-2">
       <svg viewBox="0 0 24 24" class="w-7 h-7" fill="none" stroke="#3ecf8e" stroke-width="1.8">
         <path d="M4 7h16M4 12h10M4 17h7"/>
@@ -642,110 +570,56 @@ _HTML = """<!DOCTYPE html>
         <path d="m21 19-1.5-1.5"/>
       </svg>
       <h1 class="text-xl font-semibold tracking-tight">Supabase Bulk Uploader</h1>
-      <span class="mono text-xs px-2 py-0.5 rounded border" style="border-color:#1d6648;color:#3ecf8e;background:rgba(62,207,142,.07)">v2.0</span>
+      <span class="mono text-xs px-2 py-0.5 rounded border" style="border-color:#1d6648;color:#3ecf8e;background:rgba(62,207,142,.07)">v3.0</span>
     </div>
     <p class="text-sm" style="color:var(--muted)">
-      Envie até <strong style="color:var(--text)">40 arquivos XLSX ou CSV</strong> —
-      detecção automática do tipo (<span style="color:#93c5fd">pedidos</span> /
+      Envie um <strong style="color:var(--text)">.zip</strong> com todos os arquivos XLSX/CSV —
+      detecção automática (<span style="color:#93c5fd">pedidos</span> /
       <span style="color:#fbbf24">produtos</span> /
       <span style="color:#c4b5fd">clientes</span>) e insert direto no Supabase.
     </p>
   </div>
 
-  <!-- CONFIG (hidden) -->
-  <div class="z1 w-full max-w-3xl mb-5 p-4 rounded-xl border" style="background:var(--panel);border-color:var(--border)">
-    <p class="mono text-xs uppercase tracking-widest mb-3" style="color:var(--muted)">Conexão</p>
-    <div class="grid grid-cols-1 gap-3">
-      <div>
-        <label class="block text-xs mb-1" style="color:var(--muted)">API URL do backend</label>
-        <input id="api-url" type="text" placeholder="deixe vazio para usar este servidor"
-          class="mono w-full text-sm rounded-lg px-3 py-2 border outline-none transition"
-          style="background:#0d0d12;border-color:var(--border);color:var(--text)"
-          onfocus="this.style.borderColor='#3ecf8e'" onblur="this.style.borderColor='var(--border)'" />
-      </div>
-    </div>
-  </div>
-
-  <!-- DROP ZONE -->
-  <div id="drop-zone" class="z1 w-full max-w-3xl py-14 flex flex-col items-center gap-3 mb-4"
-       onclick="document.getElementById('file-input').click()">
-    <input type="file" id="file-input" multiple accept=".xlsx,.xls,.csv" />
-    <svg class="w-10 h-10" viewBox="0 0 24 24" fill="none" stroke-width="1.4" style="color:var(--muted)" stroke="currentColor">
+  <!-- DROP ZONE ZIP -->
+  <div id="drop-zone" class="z1 w-full max-w-2xl py-16 flex flex-col items-center gap-4 mb-6"
+       onclick="document.getElementById('zip-input').click()">
+    <input type="file" id="zip-input" accept=".zip" class="hidden" onchange="handleZipSelect(this)" />
+    <svg class="w-14 h-14" viewBox="0 0 24 24" fill="none" stroke-width="1.2" style="color:var(--muted)" stroke="currentColor">
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
       <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
     </svg>
-    <p class="text-sm font-medium">Arraste os XLSXs aqui</p>
-    <p class="text-xs" style="color:var(--muted)">clique para selecionar · .xlsx .xls .csv · máx 40 arquivos</p>
+    <div class="text-center">
+      <p class="font-medium mb-1">Arraste o arquivo <span style="color:var(--accent)">.zip</span> aqui</p>
+      <p class="text-sm" style="color:var(--muted)">ou clique para selecionar</p>
+    </div>
+    <div id="zip-info" class="hidden flex items-center gap-3 px-4 py-2 rounded-lg border" style="border-color:var(--accent);background:rgba(62,207,142,.06)">
+      <svg class="w-5 h-5 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="#3ecf8e" stroke-width="2">
+        <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+        <polyline points="13 2 13 9 20 9"/>
+      </svg>
+      <span id="zip-name" class="text-sm font-medium" style="color:var(--accent)"></span>
+      <span id="zip-size" class="mono text-xs" style="color:var(--muted)"></span>
+      <button onclick="clearZip(event)" class="ml-2 text-xs" style="color:var(--muted)" onmouseover="this.style.color='var(--red)'" onmouseout="this.style.color='var(--muted)'">✕</button>
+    </div>
   </div>
 
-  <!-- CONTADOR + LIMPAR -->
-  <div class="z1 w-full max-w-3xl flex justify-between items-center mb-2 px-1">
-    <span id="file-count" class="mono text-xs" style="color:var(--muted)">0 arquivos</span>
-    <button onclick="clearAll()" class="text-xs px-3 py-1 rounded-lg border transition"
-      style="border-color:var(--border);color:var(--muted)"
-      onmouseover="this.style.color='var(--red)';this.style.borderColor='rgba(248,113,113,.4)'"
-      onmouseout="this.style.color='var(--muted)';this.style.borderColor='var(--border)'">Limpar</button>
+  <!-- OPÇÃO: TROCA DIÁRIA -->
+  <div class="z1 w-full max-w-2xl mb-5 flex items-center gap-2">
+    <input type="checkbox" id="replace-pedidos" style="accent-color:var(--accent);width:16px;height:16px" />
+    <label for="replace-pedidos" class="text-sm" style="color:var(--text)">
+      Substituir pedidos <span style="color:var(--muted)">(troca diária — apaga a tabela antes de inserir)</span>
+    </label>
   </div>
 
-  <!-- LISTA DE ARQUIVOS -->
-  <div id="file-list" class="z1 scroll w-full max-w-3xl flex flex-col gap-2 mb-5"></div>
-
-  <!-- OPÇÃO: TROCA DIÁRIA DE PEDIDOS -->
-  <div class="z1 w-full max-w-3xl mb-3 flex items-center gap-2">
-    <input type="checkbox" id="replace-pedidos" class="rounded border" style="border-color:var(--border);accent-color:var(--accent)" />
-    <label for="replace-pedidos" class="text-sm" style="color:var(--text)">Substituir pedidos (troca diária — apaga a tabela antes de inserir)</label>
-  </div>
-
-  <!-- BOTÕES -->
-  <div class="z1 w-full max-w-3xl mb-3">
-    <button id="upload-btn" class="btn-primary" disabled onclick="startUpload()">
-      ⚡ Enviar arquivos individuais
+  <!-- BOTÃO ENVIAR -->
+  <div class="z1 w-full max-w-2xl mb-8">
+    <button id="send-btn" class="btn w-full" disabled onclick="startZipUpload()">
+      ⚡ Enviar para Supabase
     </button>
   </div>
 
-  <!-- SEPARADOR -->
-  <div class="z1 w-full max-w-3xl flex items-center gap-3 mb-3">
-    <div class="flex-1 h-px" style="background:var(--border)"></div>
-    <span class="text-xs" style="color:var(--muted)">ou envie um ZIP com todos os arquivos</span>
-    <div class="flex-1 h-px" style="background:var(--border)"></div>
-  </div>
-
-  <!-- UPLOAD ZIP -->
-  <div class="z1 w-full max-w-3xl mb-6 p-4 rounded-xl border" style="background:var(--panel);border-color:var(--border)">
-    <p class="mono text-xs uppercase tracking-widest mb-2" style="color:var(--muted)">Upload em lote via ZIP</p>
-    <p class="text-sm mb-3" style="color:var(--text)">Compacte todos os arquivos em um <strong>.zip</strong> e envie de uma vez. Ideal para lotes grandes (ex: 32 arquivos × 22 MB).</p>
-    <div class="flex gap-3 items-center">
-      <input type="file" id="zip-input" accept=".zip" class="hidden" onchange="handleZipSelect(this)" />
-      <button onclick="document.getElementById('zip-input').click()"
-        class="px-4 py-2 rounded-lg text-sm font-medium border transition flex-shrink-0"
-        style="border-color:var(--accent);color:var(--accent);background:rgba(62,207,142,.08)"
-        onmouseover="this.style.background='rgba(62,207,142,.15)'" onmouseout="this.style.background='rgba(62,207,142,.08)'">
-        📦 Selecionar .zip
-      </button>
-      <span id="zip-name" class="text-sm truncate" style="color:var(--muted)">Nenhum arquivo selecionado</span>
-      <button id="zip-btn" class="btn-primary" style="width:auto;padding:8px 20px;flex-shrink:0" disabled onclick="startZipUpload()">
-        ⚡ Enviar ZIP
-      </button>
-    </div>
-    <div id="zip-prog-sec" class="mt-3 hidden">
-      <div class="flex justify-between text-xs mb-2" style="color:var(--muted)">
-        <span id="zip-prog-label" class="pulse">Enviando ZIP…</span>
-        <span id="zip-prog-pct" class="mono">0%</span>
-      </div>
-      <div class="bar-wrap"><div id="zip-prog-fill" class="bar-fill" style="width:0%"></div></div>
-    </div>
-  </div>
-
-  <!-- BASE ENRIQUECIDA (após subir as bases) -->
-  <div class="z1 w-full max-w-3xl mb-6 p-4 rounded-xl border" style="background:var(--panel);border-color:var(--border)">
-    <p class="mono text-xs uppercase tracking-widest mb-2" style="color:var(--muted)">Base enriquecida</p>
-    <p class="text-sm mb-3" style="color:var(--text)">Depois de subir Clientes, Pedidos e Produtos: crie a view que cruza as 3 tabelas (SKU → produtos, single_id → clientes).</p>
-    <button type="button" onclick="setupEnriquecida()" class="px-4 py-2 rounded-lg text-sm font-medium border transition" style="border-color:var(--accent);color:var(--accent);background:rgba(62,207,142,.08)" onmouseover="this.style.background='rgba(62,207,142,.15)'" onmouseout="this.style.background='rgba(62,207,142,.08)'">Criar/atualizar view pedidos_enriquecida</button>
-    <span id="enriquecida-msg" class="ml-2 text-sm"></span>
-  </div>
-
   <!-- PROGRESSO -->
-  <div id="prog-sec" class="z1 w-full max-w-3xl mb-5 hidden">
+  <div id="prog-sec" class="z1 w-full max-w-2xl mb-6 hidden">
     <div class="flex justify-between text-xs mb-2" style="color:var(--muted)">
       <span id="prog-label" class="pulse">Enviando…</span>
       <span id="prog-pct" class="mono">0%</span>
@@ -754,268 +628,132 @@ _HTML = """<!DOCTYPE html>
   </div>
 
   <!-- SUMÁRIO -->
-  <div id="summary" class="z1 w-full max-w-3xl mb-4 hidden">
-    <div class="grid grid-cols-3 gap-3 mb-5">
-      <div class="stat"><p class="mono text-2xl font-semibold" id="s-total">0</p><p class="text-xs mt-1" style="color:var(--muted)">Total</p></div>
+  <div id="summary" class="z1 w-full max-w-2xl mb-5 hidden">
+    <div class="grid grid-cols-3 gap-3">
+      <div class="stat"><p class="mono text-2xl font-semibold" id="s-total">0</p><p class="text-xs mt-1" style="color:var(--muted)">Arquivos</p></div>
       <div class="stat" style="border-color:rgba(62,207,142,.3)"><p class="mono text-2xl font-semibold" id="s-ok" style="color:var(--accent)">0</p><p class="text-xs mt-1" style="color:var(--muted)">Sucesso</p></div>
       <div class="stat" style="border-color:rgba(248,113,113,.3)"><p class="mono text-2xl font-semibold text-red-400" id="s-err">0</p><p class="text-xs mt-1" style="color:var(--muted)">Falhas</p></div>
     </div>
   </div>
 
   <!-- RESULTADOS -->
-  <div id="results-sec" class="z1 w-full max-w-3xl hidden">
+  <div id="results-sec" class="z1 w-full max-w-2xl mb-8 hidden">
     <p class="mono text-xs uppercase tracking-widest mb-3" style="color:var(--muted)">Detalhe por arquivo</p>
     <div id="results-list" class="scroll flex flex-col gap-2"></div>
   </div>
 
+  <!-- BASE ENRIQUECIDA -->
+  <div class="z1 w-full max-w-2xl p-5 rounded-xl border" style="background:var(--panel);border-color:var(--border)">
+    <p class="mono text-xs uppercase tracking-widest mb-1" style="color:var(--muted)">Base enriquecida</p>
+    <p class="text-sm mb-4" style="color:var(--text)">
+      Após subir as 3 bases, crie a view que cruza
+      <span style="color:#93c5fd">Pedidos</span> +
+      <span style="color:#fbbf24">Produtos</span> +
+      <span style="color:#c4b5fd">Clientes</span>.
+    </p>
+    <div class="flex items-center gap-3">
+      <button onclick="setupEnriquecida()"
+        class="px-4 py-2 rounded-lg text-sm font-medium border transition"
+        style="border-color:var(--accent);color:var(--accent);background:rgba(62,207,142,.08)"
+        onmouseover="this.style.background='rgba(62,207,142,.18)'" onmouseout="this.style.background='rgba(62,207,142,.08)'">
+        Criar view pedidos_enriquecida
+      </button>
+      <span id="enriquecida-msg" class="text-sm"></span>
+    </div>
+  </div>
+
 <script>
-let selectedFiles = [];
 const TABLE_COLORS = { pedidos:'type-pedidos', produtos:'type-produtos', clientes:'type-clientes', generico:'type-generico' };
+let selectedZip = null;
 
 // ── DRAG & DROP ──────────────────────────────────────────────
 const zone = document.getElementById('drop-zone');
 zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('over'); });
 zone.addEventListener('dragleave', () => zone.classList.remove('over'));
-zone.addEventListener('drop', e => { e.preventDefault(); zone.classList.remove('over'); addFiles([...e.dataTransfer.files]); });
-document.getElementById('file-input').addEventListener('change', e => { addFiles([...e.target.files]); e.target.value=''; });
+zone.addEventListener('drop', e => {
+  e.preventDefault(); zone.classList.remove('over');
+  const f = [...e.dataTransfer.files].find(f => f.name.toLowerCase().endsWith('.zip'));
+  if (f) setZip(f); else alert('Envie um arquivo .zip');
+});
 
-function addFiles(files) {
-  const xlsx = files.filter(f => f.name.match(/\\.(xlsx|xls|csv)$/i));
-  for (const f of xlsx) {
-    if (selectedFiles.length >= 40) { alert('Máximo de 40 arquivos!'); break; }
-    if (!selectedFiles.find(x => x.name === f.name)) selectedFiles.push(f);
-  }
-  render();
+function handleZipSelect(input) {
+  if (input.files[0]) setZip(input.files[0]);
+  input.value = '';
 }
-function removeFile(name) { selectedFiles = selectedFiles.filter(f => f.name !== name); render(); }
-function clearAll() {
-  selectedFiles = [];
-  render();
+
+function setZip(f) {
+  selectedZip = f;
+  document.getElementById('zip-name').textContent = f.name;
+  document.getElementById('zip-size').textContent = (f.size / 1024 / 1024).toFixed(1) + ' MB';
+  document.getElementById('zip-info').classList.remove('hidden');
+  document.getElementById('send-btn').disabled = false;
+}
+
+function clearZip(e) {
+  e.stopPropagation();
+  selectedZip = null;
+  document.getElementById('zip-info').classList.add('hidden');
+  document.getElementById('send-btn').disabled = true;
   ['summary','results-sec','prog-sec'].forEach(id => document.getElementById(id).classList.add('hidden'));
 }
 
-// Detecta tipo do arquivo pelo nome (rápido, sem ler o xlsx)
-function guessType(name) {
-  // CSV herda o mesmo tipo pelo nome
-  const n = name.toLowerCase();
-  if (/pedido|order/i.test(n))   return 'pedidos';
-  if (/sku|produto|product/i.test(n)) return 'produtos';
-  if (/cliente|customer/i.test(n)) return 'clientes';
-  return '?';
-}
-
-function render() {
-  const list = document.getElementById('file-list');
-  list.innerHTML = '';
-  for (const f of selectedFiles) {
-    const tipo = guessType(f.name);
-    const tc   = TABLE_COLORS[tipo] || 'type-generico';
-    const size = (f.size/1024).toFixed(0) + ' KB';
-    const chip = document.createElement('div');
-    chip.className = 'chip';
-    chip.innerHTML = `
-      <svg class="w-4 h-4 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="#3ecf8e" stroke-width="2">
-        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-        <polyline points="14 2 14 8 20 8"/>
-      </svg>
-      <span class="truncate">${f.name}</span>
-      <span class="type-badge ${tc}">${tipo}</span>
-      <span class="mono flex-shrink-0" style="color:var(--muted)">${size}</span>
-      <span class="x" onclick="removeFile('${f.name}')">✕</span>
-    `;
-    list.appendChild(chip);
-  }
-  document.getElementById('file-count').textContent = `${selectedFiles.length} arquivo(s)`;
-  document.getElementById('upload-btn').disabled = selectedFiles.length === 0;
-}
-
-// ── COMPRESSÃO GZIP (browser nativo via CompressionStream) ──
-async function compressFile(file) {
-  const buffer = await file.arrayBuffer();
-  const stream = new Blob([buffer]).stream();
-  const compressed = stream.pipeThrough(new CompressionStream('gzip'));
-  const chunks = [];
-  const reader = compressed.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-  }
-  const compressedBlob = new Blob(chunks, { type: 'application/gzip' });
-  // Retorna novo File com .gz no nome para o backend identificar
-  return new File([compressedBlob], file.name + '.gz', { type: 'application/gzip' });
-}
-
-// ── UPLOAD COM COMPRESSÃO ────────────────────────────────────
-async function startUpload() {
-  const btn = document.getElementById('upload-btn');
-  btn.disabled = true; btn.textContent = '⏳ Comprimindo…';
-
-  const ps = document.getElementById('prog-sec');
-  ps.classList.remove('hidden');
-  setProgress(5);
-
-  // 1. Comprimir todos os arquivos em paralelo
-  const label = document.getElementById('prog-label');
-  label.textContent = 'Comprimindo arquivos…';
-  label.classList.add('pulse');
-
-  let compressed;
-  try {
-    compressed = await Promise.all(selectedFiles.map(compressFile));
-  } catch (err) {
-    label.textContent = '✗ Erro ao comprimir: ' + err.message;
-    label.classList.remove('pulse');
-    label.style.color = 'var(--red)';
-    btn.disabled = false; btn.textContent = '⚡ Enviar para Supabase';
-    return;
-  }
-
-  // Mostrar redução de tamanho
-  const originalSize  = selectedFiles.reduce((s, f) => s + f.size, 0);
-  const compressedSize = compressed.reduce((s, f) => s + f.size, 0);
-  const reduction = Math.round((1 - compressedSize / originalSize) * 100);
-  label.textContent = `Enviando… (comprimido ${reduction}% menor)`;
-  setProgress(30);
-
-  // 2. Enviar em lotes de 10 arquivos para não estourar o limite da Vercel
-  const BATCH = 10;
-  const allResults = [];
-  const url = window.location.origin + '/upload';
-
-  try {
-    const replacePedidos = document.getElementById('replace-pedidos').checked;
-    for (let i = 0; i < compressed.length; i += BATCH) {
-      const batch = compressed.slice(i, i + BATCH);
-      const form  = new FormData();
-      for (const f of batch) form.append('files', f);
-      form.append('replace_pedidos', (i === 0 && replacePedidos) ? 'true' : 'false');
-
-      label.textContent = `Enviando lote ${Math.floor(i/BATCH)+1} de ${Math.ceil(compressed.length/BATCH)}… (comprimido ${reduction}% menor)`;
-      setProgress(30 + Math.round((i / compressed.length) * 60));
-
-      const res = await fetch(url, { method: 'POST', body: form });
-      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-      const data = await res.json();
-      allResults.push(...data.results);
-    }
-
-    setProgress(100);
-    label.textContent = '✓ Concluído';
-    label.classList.remove('pulse');
-    label.style.color = 'var(--accent)';
-
-    const ok  = allResults.filter(r => r.status === 'ok').length;
-    const err = allResults.filter(r => r.status !== 'ok').length;
-    showResults({ total: allResults.length, success: ok, failed: err, results: allResults });
-
-  } catch (err) {
-    label.textContent = '✗ ' + err.message;
-    label.classList.remove('pulse');
-    label.style.color = 'var(--red)';
-  }
-
-  btn.disabled = false; btn.textContent = '⚡ Enviar para Supabase';
-}
-
-function setProgress(p) {
-  document.getElementById('prog-fill').style.width = p + '%';
-  document.getElementById('prog-pct').textContent  = p + '%';
-}
-
 // ── UPLOAD ZIP ──────────────────────────────────────────────
-let selectedZip = null;
-
-function handleZipSelect(input) {
-  const f = input.files[0];
-  if (!f) return;
-  selectedZip = f;
-  document.getElementById('zip-name').textContent = f.name + ' (' + (f.size / 1024 / 1024).toFixed(1) + ' MB)';
-  document.getElementById('zip-btn').disabled = false;
-}
-
 async function startZipUpload() {
   if (!selectedZip) return;
-  const btn = document.getElementById('zip-btn');
-  const ps  = document.getElementById('zip-prog-sec');
-  const label = document.getElementById('zip-prog-label');
-  const fill  = document.getElementById('zip-prog-fill');
-  const pct   = document.getElementById('zip-prog-pct');
+
+  const btn   = document.getElementById('send-btn');
+  const ps    = document.getElementById('prog-sec');
+  const label = document.getElementById('prog-label');
+  const fill  = document.getElementById('prog-fill');
+  const pct   = document.getElementById('prog-pct');
 
   btn.disabled = true;
   ps.classList.remove('hidden');
+  ['summary','results-sec'].forEach(id => document.getElementById(id).classList.add('hidden'));
   label.classList.add('pulse');
   label.style.color = '';
-  label.textContent = 'Enviando ZIP… (' + (selectedZip.size / 1024 / 1024).toFixed(1) + ' MB)';
-  fill.style.width = '10%'; pct.textContent = '10%';
+  fill.style.width = '2%'; pct.textContent = '2%';
 
   const form = new FormData();
   form.append('file', selectedZip);
-  const replacePedidos = document.getElementById('replace-pedidos').checked;
-  form.append('replace_pedidos', replacePedidos ? 'true' : 'false');
+  form.append('replace_pedidos', document.getElementById('replace-pedidos').checked ? 'true' : 'false');
 
-  // Simular progresso enquanto envia (XHR para progresso real)
   try {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', window.location.origin + '/upload-zip');
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) {
-        const p = Math.round((e.loaded / e.total) * 80);
-        fill.style.width = (10 + p) + '%';
-        pct.textContent = (10 + p) + '%';
-        label.textContent = 'Enviando… ' + (e.loaded / 1024 / 1024).toFixed(1) + ' / ' + (e.total / 1024 / 1024).toFixed(1) + ' MB';
+        const p = Math.round((e.loaded / e.total) * 70);
+        fill.style.width = (2 + p) + '%';
+        pct.textContent  = (2 + p) + '%';
+        label.textContent = 'Enviando… ' + (e.loaded/1024/1024).toFixed(1) + ' / ' + (e.total/1024/1024).toFixed(1) + ' MB';
       }
     };
 
     const data = await new Promise((resolve, reject) => {
       xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(JSON.parse(xhr.responseText));
-        } else {
-          reject(new Error('HTTP ' + xhr.status + ': ' + xhr.responseText));
-        }
+        if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText));
+        else reject(new Error('HTTP ' + xhr.status + ': ' + xhr.responseText));
       };
       xhr.onerror = () => reject(new Error('Erro de rede'));
       xhr.send(form);
     });
 
     fill.style.width = '100%'; pct.textContent = '100%';
-    label.textContent = '✓ Concluído';
+    label.textContent = '✓ Concluído — ' + data.success + ' de ' + data.total + ' arquivos processados';
     label.classList.remove('pulse');
     label.style.color = 'var(--accent)';
-
-    const ok  = data.results.filter(r => r.status === 'ok').length;
-    const err = data.results.filter(r => r.status !== 'ok').length;
-    showResults({ total: data.total, success: ok, failed: err, results: data.results });
+    showResults(data);
 
   } catch (err) {
+    fill.style.width = '100%';
     label.textContent = '✗ ' + err.message;
     label.classList.remove('pulse');
     label.style.color = 'var(--red)';
   }
 
   btn.disabled = false;
-}
-
-async function setupEnriquecida() {
-  const el = document.getElementById('enriquecida-msg');
-  el.textContent = '…';
-  el.style.color = 'var(--muted)';
-  try {
-    const res = await fetch(window.location.origin + '/setup-enriquecida', { method: 'POST' });
-    const data = await res.json();
-    if (data.status === 'ok') {
-      el.textContent = '✓ ' + (data.message || 'View criada.');
-      el.style.color = 'var(--accent)';
-    } else {
-      el.textContent = '✗ ' + (data.message || 'Erro');
-      el.style.color = 'var(--red)';
-    }
-  } catch (err) {
-    el.textContent = '✗ ' + err.message;
-    el.style.color = 'var(--red)';
-  }
 }
 
 function showResults(data) {
@@ -1026,39 +764,48 @@ function showResults(data) {
 
   const list = document.getElementById('results-list');
   list.innerHTML = '';
-  for (const r of data.results) {
-    const row = document.createElement('div');
-    row.className = 'res-row';
-    const tc = TABLE_COLORS[r.table] || 'type-generico';
-    const badge = r.status === 'ok'
-      ? '<span class="badge b-ok">OK</span>'
-      : '<span class="badge b-err">ERRO</span>';
-    const tbl  = r.table ? `<span class="type-badge ${tc}">${r.table}</span>` : '';
-    const rows = r.rows  ? `<span class="mono text-xs" style="color:var(--muted)">${r.rows} linhas</span>` : '';
-    const time = `<span class="mono text-xs" style="color:var(--muted)">${r.elapsed_s}s</span>`;
 
-    row.innerHTML = `<span class="truncate text-sm">${r.file}</span>${tbl}${rows}${time}${badge}`;
+  for (const r of data.results) {
+    const tc    = TABLE_COLORS[r.table] || 'type-generico';
+    const badge = r.status === 'ok' ? '<span class="badge b-ok">OK</span>' : '<span class="badge b-err">ERRO</span>';
+    const tbl   = r.table ? `<span class="type-badge ${tc}">${r.table}</span>` : '';
+    const rows  = r.rows  ? `<span class="mono text-xs" style="color:var(--muted)">${r.rows.toLocaleString('pt-BR')} linhas</span>` : '';
+    const t     = `<span class="mono text-xs" style="color:var(--muted)">${r.elapsed_s}s</span>`;
 
     if (r.error) {
       const wrap = document.createElement('div');
-      wrap.style.cssText = 'display:block';
-      wrap.innerHTML = `<div style="display:grid;grid-template-columns:1fr auto auto auto;gap:8px;align-items:center">
-        <span class="truncate text-sm">${r.file}</span>${tbl}${rows}${time}${badge}</div>`;
-      const detail = document.createElement('pre');
-      detail.style.cssText = 'margin-top:6px;font-size:11px;color:var(--red);white-space:pre-wrap;overflow-x:auto;padding:8px;background:#1a0808;border-radius:6px';
-      detail.textContent = r.error;
-      wrap.appendChild(detail);
+      wrap.innerHTML = `<div class="res-row"><span class="truncate text-sm">${r.file}</span>${tbl}${t}${badge}</div>`;
+      const pre = document.createElement('pre');
+      pre.style.cssText = 'margin-top:4px;font-size:11px;color:var(--red);white-space:pre-wrap;padding:8px;background:#1a0808;border-radius:6px';
+      pre.textContent = r.error;
+      wrap.appendChild(pre);
       list.appendChild(wrap);
-      continue;
+    } else {
+      const row = document.createElement('div');
+      row.className = 'res-row';
+      row.innerHTML = `<span class="truncate text-sm">${r.file}</span>${tbl}${rows}${t}${badge}`;
+      list.appendChild(row);
     }
-    list.appendChild(row);
   }
   document.getElementById('results-sec').classList.remove('hidden');
 }
+
+async function setupEnriquecida() {
+  const el = document.getElementById('enriquecida-msg');
+  el.textContent = '…'; el.style.color = 'var(--muted)';
+  try {
+    const res  = await fetch(window.location.origin + '/setup-enriquecida', { method: 'POST' });
+    const data = await res.json();
+    el.textContent = data.status === 'ok' ? '✓ View criada/atualizada' : '✗ ' + data.message;
+    el.style.color = data.status === 'ok' ? 'var(--accent)' : 'var(--red)';
+  } catch (err) {
+    el.textContent = '✗ ' + err.message;
+    el.style.color = 'var(--red)';
+  }
+}
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.get("/", response_class=HTMLResponse)
 def frontend():
