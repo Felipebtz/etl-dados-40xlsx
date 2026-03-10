@@ -1,19 +1,21 @@
 """
 Supabase Bulk XLSX Uploader
 Detecta automaticamente o tipo de arquivo (pedidos / produtos / clientes)
-e insere na tabela correta via conexão direta PostgreSQL (psycopg2 + COPY).
+e insere na tabela correta via PostgreSQL ou, se configurado, via GCP Storage + BigQuery.
 """
 
 import asyncio
 import gzip
 import io
+import json
 import os
 import re
 import time
 import traceback
+import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -44,6 +46,48 @@ CONFIG = {
     "max_workers": int(os.getenv("MAX_WORKERS", "8")),
     "chunk_size":  int(os.getenv("CHUNK_SIZE",  "1000")),
 }
+
+# ──────────────────────────────────────────────────────────────
+# GCP (Storage + BigQuery) — quando configurado, upload vai direto para GCS e load no BigQuery
+# ──────────────────────────────────────────────────────────────
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "").strip()
+GCP_BUCKET = os.getenv("GCP_BUCKET", "").strip()
+GCP_DATASET = os.getenv("GCP_DATASET", "etl").strip()
+GCP_CREDENTIALS_JSON = os.getenv("GCP_CREDENTIALS_JSON", "").strip()
+
+
+def _gcp_credentials():
+    """Retorna credenciais GCP a partir de env (JSON string ou caminho do arquivo)."""
+    if GCP_CREDENTIALS_JSON:
+        try:
+            info = json.loads(GCP_CREDENTIALS_JSON)
+            from google.oauth2 import service_account
+            return service_account.Credentials.from_service_account_info(info)
+        except Exception:
+            return None
+    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if path and os.path.isfile(path):
+        from google.oauth2 import service_account
+        return service_account.Credentials.from_service_account_file(path)
+    return None
+
+
+def is_gcp_configured():
+    return bool(GCP_PROJECT_ID and GCP_BUCKET and _gcp_credentials())
+
+
+def get_gcp_storage_client():
+    if not is_gcp_configured():
+        return None
+    from google.cloud import storage
+    return storage.Client(project=GCP_PROJECT_ID, credentials=_gcp_credentials())
+
+
+def get_bigquery_client():
+    if not is_gcp_configured():
+        return None
+    from google.cloud import bigquery
+    return bigquery.Client(project=GCP_PROJECT_ID, credentials=_gcp_credentials())
 
 # ──────────────────────────────────────────────────────────────
 # SCHEMA DE CADA TABELA
@@ -403,6 +447,117 @@ def setup_enriquecida():
 
 
 # ──────────────────────────────────────────────────────────────
+# GCP: modo Storage + BigQuery (upload direto do browser → GCS, load no BQ)
+# ──────────────────────────────────────────────────────────────
+@app.get("/config")
+def get_config():
+    """Indica se o backend está em modo GCP (Storage + BigQuery) ou Postgres."""
+    return {"mode": "gcp" if is_gcp_configured() else "postgres"}
+
+
+from pydantic import BaseModel
+
+
+class GcpUploadUrlRequest(BaseModel):
+    filename: str
+    table_type: str  # pedidos | produtos | clientes | generico
+    content_type: str = "application/octet-stream"
+
+
+class GcpLoadRequest(BaseModel):
+    gcs_uri: str
+    table_type: str
+    replace_pedidos: bool = False
+
+
+@app.post("/gcp/upload-url")
+def gcp_upload_url(body: GcpUploadUrlRequest):
+    """
+    Gera URL assinada para o frontend enviar o arquivo direto ao GCS.
+    O Railway não recebe o arquivo — evita 502 com arquivos grandes.
+    """
+    if not is_gcp_configured():
+        raise HTTPException(503, "GCP não configurado (GCP_PROJECT_ID, GCP_BUCKET, GCP_CREDENTIALS_JSON).")
+    client = get_gcp_storage_client()
+    bucket = client.bucket(GCP_BUCKET)
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", body.filename)
+    object_path = f"uploads/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4().hex}_{safe_name}"
+    blob = bucket.blob(object_path)
+    url = blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(hours=2),
+        method="PUT",
+        content_type=body.content_type or "application/octet-stream",
+    )
+    gcs_uri = f"gs://{GCP_BUCKET}/{object_path}"
+    return {"upload_url": url, "gcs_uri": gcs_uri, "object_name": object_path}
+
+
+@app.post("/gcp/load")
+def gcp_load(body: GcpLoadRequest):
+    """
+    Dispara job de load no BigQuery a partir do arquivo já no GCS.
+    Suporta CSV. Cria o dataset se não existir.
+    """
+    if not is_gcp_configured():
+        raise HTTPException(503, "GCP não configurado.")
+    if not body.gcs_uri.startswith("gs://"):
+        raise HTTPException(400, "gcs_uri deve ser gs://bucket/path")
+    from google.cloud import bigquery
+    client = get_bigquery_client()
+    dataset_ref = bigquery.DatasetReference(GCP_PROJECT_ID, GCP_DATASET)
+    try:
+        client.get_dataset(dataset_ref)
+    except Exception:
+        client.create_dataset(dataset_ref)
+    table_id = body.table_type if body.table_type in ("pedidos", "produtos", "clientes") else "generico"
+    table_ref = f"{GCP_PROJECT_ID}.{GCP_DATASET}.{table_id}"
+
+    job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.CSV,
+        autodetect=True,
+        skip_leading_rows=1,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
+        if (body.table_type == "pedidos" and body.replace_pedidos)
+        else bigquery.WriteDisposition.WRITE_APPEND,
+    )
+    load_job = client.load_table_from_uri(body.gcs_uri, table_ref, job_config=job_config)
+    try:
+        load_job.result(timeout=600)
+        return {"status": "ok", "rows": load_job.output_rows or 0, "table": table_id}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "table": table_id}
+
+
+@app.post("/gcp/setup-enriquecida")
+def gcp_setup_enriquecida():
+    """
+    Cria a view pedidos_enriquecida no BigQuery (join pedidos + produtos + clientes).
+    """
+    if not is_gcp_configured():
+        raise HTTPException(503, "GCP não configurado.")
+    client = get_bigquery_client()
+    view_sql = f"""
+    CREATE OR REPLACE VIEW `{GCP_PROJECT_ID}.{GCP_DATASET}.pedidos_enriquecida` AS
+    SELECT
+      p.cod_pedido, p.id_cliente, p.single_id, p.sku,
+      p.valor_item_pedido, p.valor_item_pedido_frete, p.qtd_itens,
+      p.canal_venda, p.bandeira, p.data_pedido, p.valor_frete, p.data_entrega,
+      prod.nome_sku AS produto_nome_sku, prod.nome_marca AS produto_marca,
+      prod.nome_setor_gerencial AS produto_setor, prod.nome_categoria_gerencial AS produto_categoria,
+      c.nome AS cliente_nome, c.email AS cliente_email, c.cpf AS cliente_cpf, c.telefone AS cliente_telefone
+    FROM `{GCP_PROJECT_ID}.{GCP_DATASET}.pedidos` p
+    LEFT JOIN `{GCP_PROJECT_ID}.{GCP_DATASET}.produtos` prod ON p.sku = prod.sku
+    LEFT JOIN `{GCP_PROJECT_ID}.{GCP_DATASET}.clientes` c ON p.single_id = c.single_id
+    """
+    try:
+        client.query(view_sql).result()
+        return {"status": "ok", "message": "View pedidos_enriquecida criada/atualizada no BigQuery."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ──────────────────────────────────────────────────────────────
 # ENDPOINTS
 # ──────────────────────────────────────────────────────────────
 
@@ -477,13 +632,15 @@ async def upload_zip(
 @app.get("/health")
 @app.get("/api/health")
 def health():
+    if is_gcp_configured():
+        return {"status": "ok", "mode": "gcp"}
     try:
         conn = get_conn()
         conn.close()
         db_ok = True
     except Exception as e:
         db_ok = str(e)
-    return {"status": "ok", "db_connected": db_ok}
+    return {"status": "ok", "db_connected": db_ok, "mode": "postgres"}
 
 
 from fastapi.responses import HTMLResponse
@@ -522,7 +679,7 @@ _HTML = """<!DOCTYPE html>
       border: 2px dashed var(--border); border-radius: 16px;
       transition: border-color .2s, background .2s; cursor: pointer;
     }
-    #drop-zone.over { border-color: var(--accent); background: rgba(62,207,142,.04); }
+    #drop-zone.over, #gcp-drop-zone.over { border-color: var(--accent); background: rgba(62,207,142,.04); }
 
     /* PROGRESS */
     .bar-wrap { height: 4px; background: var(--border); border-radius: 99px; overflow: hidden; }
@@ -572,14 +729,13 @@ _HTML = """<!DOCTYPE html>
       <h1 class="text-xl font-semibold tracking-tight">Supabase Bulk Uploader</h1>
       <span class="mono text-xs px-2 py-0.5 rounded border" style="border-color:#1d6648;color:#3ecf8e;background:rgba(62,207,142,.07)">v3.0</span>
     </div>
-    <p class="text-sm" style="color:var(--muted)">
-      Envie um <strong style="color:var(--text)">.zip</strong> com todos os arquivos XLSX/CSV —
-      detecção automática (<span style="color:#93c5fd">pedidos</span> /
-      <span style="color:#fbbf24">produtos</span> /
-      <span style="color:#c4b5fd">clientes</span>) e insert direto no Supabase.
+    <p class="text-sm" style="color:var(--muted)" id="header-desc">
+      Carregando…
     </p>
   </div>
 
+  <!-- MODO POSTGRES: ZIP -->
+  <div id="ui-postgres" class="z1 w-full max-w-2xl" style="display:none">
   <!-- DROP ZONE ZIP -->
   <div id="drop-zone" class="z1 w-full max-w-2xl py-16 flex flex-col items-center gap-4 mb-6"
        onclick="document.getElementById('zip-input').click()">
@@ -661,12 +817,162 @@ _HTML = """<!DOCTYPE html>
       <span id="enriquecida-msg" class="text-sm"></span>
     </div>
   </div>
+  </div>
+  <!-- FIM MODO POSTGRES -->
+
+  <!-- MODO GCP: Storage + BigQuery (arquivos direto para GCS, sem passar pelo Railway) -->
+  <div id="ui-gcp" class="z1 w-full max-w-2xl" style="display:none">
+    <p class="text-sm mb-4" style="color:var(--muted)">
+      Arquivos vão <strong style="color:var(--text)">direto para o GCP Storage</strong> e depois são carregados no <strong style="color:var(--text)">BigQuery</strong>. Use <strong>.csv</strong> (BigQuery não carrega XLSX direto). Até 40 arquivos.
+    </p>
+    <div id="gcp-drop-zone" class="w-full py-12 flex flex-col items-center gap-4 mb-6 rounded-2xl border-2 border-dashed cursor-pointer transition"
+         style="border-color:var(--border);" onclick="document.getElementById('gcp-file-input').click()">
+      <input type="file" id="gcp-file-input" accept=".csv" multiple class="hidden" />
+      <p class="font-medium">Arraste CSVs aqui ou clique</p>
+      <p id="gcp-file-count" class="text-sm" style="color:var(--muted)">0 arquivos</p>
+    </div>
+    <div class="flex items-center gap-2 mb-5">
+      <input type="checkbox" id="gcp-replace-pedidos" style="accent-color:var(--accent);width:16px;height:16px" />
+      <label for="gcp-replace-pedidos" class="text-sm">Substituir pedidos (troca diária)</label>
+    </div>
+    <button id="gcp-send-btn" class="btn w-full mb-6" disabled onclick="startGcpUpload()">Enviar para BigQuery</button>
+    <div id="gcp-prog-sec" class="mb-6 hidden">
+      <div class="flex justify-between text-xs mb-2" style="color:var(--muted)">
+        <span id="gcp-prog-label">Enviando…</span>
+        <span id="gcp-prog-pct" class="mono">0%</span>
+      </div>
+      <div class="bar-wrap"><div id="gcp-prog-fill" class="bar-fill" style="width:0%"></div></div>
+    </div>
+    <div id="gcp-summary" class="mb-5 hidden">
+      <div class="grid grid-cols-3 gap-3">
+        <div class="stat"><p class="mono text-2xl font-semibold" id="gcp-s-total">0</p><p class="text-xs mt-1" style="color:var(--muted)">Arquivos</p></div>
+        <div class="stat" style="border-color:rgba(62,207,142,.3)"><p class="mono text-2xl font-semibold" id="gcp-s-ok" style="color:var(--accent)">0</p><p class="text-xs mt-1" style="color:var(--muted)">Sucesso</p></div>
+        <div class="stat" style="border-color:rgba(248,113,113,.3)"><p class="mono text-2xl font-semibold text-red-400" id="gcp-s-err">0</p><p class="text-xs mt-1" style="color:var(--muted)">Falhas</p></div>
+      </div>
+    </div>
+    <div class="z1 w-full max-w-2xl p-5 rounded-xl border mb-6" style="background:var(--panel);border-color:var(--border)">
+      <p class="mono text-xs uppercase tracking-widest mb-1" style="color:var(--muted)">Base enriquecida (BigQuery)</p>
+      <p class="text-sm mb-4" style="color:var(--text)">Após subir as 3 bases, crie a view.</p>
+      <button onclick="setupGcpEnriquecida()" class="px-4 py-2 rounded-lg text-sm font-medium border transition" style="border-color:var(--accent);color:var(--accent);background:rgba(62,207,142,.08)">Criar view pedidos_enriquecida</button>
+      <span id="gcp-enriquecida-msg" class="text-sm ml-2"></span>
+    </div>
+  </div>
 
 <script>
 const TABLE_COLORS = { pedidos:'type-pedidos', produtos:'type-produtos', clientes:'type-clientes', generico:'type-generico' };
 let selectedZip = null;
+let gcpFiles = [];
+let APP_MODE = 'postgres';
 
-// ── DRAG & DROP ──────────────────────────────────────────────
+// ── CONFIG: mostra UI Postgres (ZIP) ou GCP (Storage + BigQuery) ──
+fetch(window.location.origin + '/config').then(r=>r.json()).then(c=>{
+  APP_MODE = c.mode;
+  const desc = document.getElementById('header-desc');
+  if (c.mode === 'gcp') {
+    desc.innerHTML = 'Modo <strong style="color:var(--text)">GCP Storage + BigQuery</strong>: envie CSVs (até 40). O arquivo vai direto para o Storage, sem passar pelo servidor.';
+    document.getElementById('ui-gcp').style.display = 'block';
+    initGcpUi();
+  } else {
+    desc.innerHTML = 'Envie um <strong style="color:var(--text)">.zip</strong> com todos os arquivos XLSX/CSV — detecção automática (pedidos / produtos / clientes) e insert direto no Supabase.';
+    document.getElementById('ui-postgres').style.display = 'block';
+  }
+}).catch(()=>{
+  document.getElementById('header-desc').textContent = 'Envie um .zip com XLSX/CSV para Supabase.';
+  document.getElementById('ui-postgres').style.display = 'block';
+});
+
+function guessType(name) {
+  const n = name.toLowerCase();
+  if (/pedido|order/i.test(n)) return 'pedidos';
+  if (/sku|produto|product/i.test(n)) return 'produtos';
+  if (/cliente|customer/i.test(n)) return 'clientes';
+  return 'generico';
+}
+
+function initGcpUi() {
+  const dz = document.getElementById('gcp-drop-zone');
+  const input = document.getElementById('gcp-file-input');
+  dz.addEventListener('dragover', e=>{ e.preventDefault(); dz.classList.add('over'); });
+  dz.addEventListener('dragleave', ()=> dz.classList.remove('over'));
+  dz.addEventListener('drop', e=>{
+    e.preventDefault(); dz.classList.remove('over');
+    addGcpFiles([...e.dataTransfer.files].filter(f=>f.name.toLowerCase().endsWith('.csv')));
+  });
+  input.addEventListener('change', e=>{ addGcpFiles([...e.target.files]); e.target.value=''; });
+}
+
+function addGcpFiles(files) {
+  for (const f of files) {
+    if (gcpFiles.length >= 40) break;
+    if (!gcpFiles.some(x=>x.name===f.name)) gcpFiles.push(f);
+  }
+  document.getElementById('gcp-file-count').textContent = gcpFiles.length + ' arquivo(s)';
+  document.getElementById('gcp-send-btn').disabled = gcpFiles.length === 0;
+}
+
+async function startGcpUpload() {
+  if (gcpFiles.length === 0) return;
+  const btn = document.getElementById('gcp-send-btn');
+  const ps = document.getElementById('gcp-prog-sec');
+  const label = document.getElementById('gcp-prog-label');
+  const fill = document.getElementById('gcp-prog-fill');
+  const pct = document.getElementById('gcp-prog-pct');
+  btn.disabled = true;
+  ps.classList.remove('hidden');
+  document.getElementById('gcp-summary').classList.add('hidden');
+  const replacePedidos = document.getElementById('gcp-replace-pedidos').checked;
+  const results = [];
+  const total = gcpFiles.length;
+  for (let i = 0; i < gcpFiles.length; i++) {
+    const file = gcpFiles[i];
+    const tableType = guessType(file.name);
+    fill.style.width = (i/total*80) + '%'; pct.textContent = Math.round(i/total*80) + '%';
+    label.textContent = 'Enviando ' + file.name + ' para GCS…';
+    try {
+      const urlRes = await fetch(window.location.origin + '/gcp/upload-url', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, table_type: tableType, content_type: file.type || 'text/csv' })
+      });
+      if (!urlRes.ok) throw new Error(await urlRes.text());
+      const { upload_url, gcs_uri } = await urlRes.json();
+      const putRes = await fetch(upload_url, { method: 'PUT', body: file, headers: { 'Content-Type': file.type || 'text/csv' } });
+      if (!putRes.ok) throw new Error('GCS PUT ' + putRes.status);
+      label.textContent = 'Carregando no BigQuery: ' + file.name + '…';
+      const loadRes = await fetch(window.location.origin + '/gcp/load', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gcs_uri, table_type: tableType, replace_pedidos: replacePedidos && tableType === 'pedidos' && i === 0 })
+      });
+      const loadData = await loadRes.json();
+      results.push({ file: file.name, status: loadData.status === 'ok' ? 'ok' : 'error', table: tableType, rows: loadData.rows || 0, error: loadData.message });
+    } catch (err) {
+      results.push({ file: file.name, status: 'error', table: guessType(file.name), error: err.message });
+    }
+  }
+  fill.style.width = '100%'; pct.textContent = '100%';
+  label.textContent = 'Concluído.';
+  const ok = results.filter(r=>r.status==='ok').length;
+  document.getElementById('gcp-s-total').textContent = results.length;
+  document.getElementById('gcp-s-ok').textContent = ok;
+  document.getElementById('gcp-s-err').textContent = results.length - ok;
+  document.getElementById('gcp-summary').classList.remove('hidden');
+  btn.disabled = false;
+}
+
+async function setupGcpEnriquecida() {
+  const el = document.getElementById('gcp-enriquecida-msg');
+  el.textContent = '…'; el.style.color = 'var(--muted)';
+  try {
+    const res = await fetch(window.location.origin + '/gcp/setup-enriquecida', { method: 'POST' });
+    const data = await res.json();
+    el.textContent = data.status === 'ok' ? 'View criada.' : data.message;
+    el.style.color = data.status === 'ok' ? 'var(--accent)' : 'var(--red)';
+  } catch (err) {
+    el.textContent = err.message;
+    el.style.color = 'var(--red)';
+  }
+}
+
+// ── DRAG & DROP (Postgres / ZIP) ──────────────────────────────────────────────
 const zone = document.getElementById('drop-zone');
 zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('over'); });
 zone.addEventListener('dragleave', () => zone.classList.remove('over'));

@@ -5,6 +5,8 @@ __pycache__/
 .env
 .env.local
 credentials.json
+# Chave de serviço GCP (use variável GCP_CREDENTIALS_JSON no Railway)
+*-*.json
 *.xlsx
 *.xls
 .DS_Store

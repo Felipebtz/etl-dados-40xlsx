@@ -6,3 +6,5 @@ openpyxl>=3.1.2
 psycopg2-binary>=2.9.9
 python-dotenv>=1.0.0
 supabase>=2.0.0
+google-cloud-storage>=2.14.0
+google-cloud-bigquery>=3.14.0
