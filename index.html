@@ -315,10 +315,10 @@ async function startUpload() {
   label.textContent = `Enviando… (comprimido ${reduction}% menor)`;
   setProgress(30);
 
-  // 2. Enviar em lotes de 10 (rota nativa da Vercel = /api/upload)
+  // 2. Enviar em lotes de 10
   const BATCH = 10;
   const allResults = [];
-  const url = window.location.origin + '/api/upload';
+  const url = window.location.origin + '/upload';
   const replacePedidos = document.getElementById('replace-pedidos').checked;
 
   try {
@@ -365,7 +365,7 @@ async function setupEnriquecida() {
   el.textContent = '…';
   el.style.color = 'var(--muted)';
   try {
-    const res = await fetch(window.location.origin + '/api/setup_enriquecida', { method: 'POST' });
+    const res = await fetch(window.location.origin + '/setup-enriquecida', { method: 'POST' });
     const data = await res.json();
     if (data.status === 'ok') {
       el.textContent = '✓ ' + (data.message || 'View criada.');

@@ -1,13 +1,12 @@
 {
   "version": 2,
   "builds": [
-    { "src": "api/upload.py", "use": "@vercel/python", "config": { "maxLambdaSize": "50mb" } },
-    { "src": "api/health.py", "use": "@vercel/python" },
-    { "src": "api/setup_enriquecida.py", "use": "@vercel/python" }
+    { "src": "api/index.py", "use": "@vercel/python", "config": { "maxLambdaSize": "50mb" } }
+  ],
+  "routes": [
+    { "src": "/(.*)", "dest": "/api/index.py" }
   ],
   "functions": {
-    "api/upload.py": { "maxDuration": 60, "memory": 1024 },
-    "api/health.py": { "maxDuration": 10, "memory": 256 },
-    "api/setup_enriquecida.py": { "maxDuration": 30, "memory": 256 }
+    "api/index.py": { "maxDuration": 60, "memory": 1024 }
   }
 }
