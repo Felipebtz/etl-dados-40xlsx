@@ -374,6 +374,7 @@ LEFT JOIN public.clientes c ON p.single_id = c.single_id;
 
 
 @app.post("/setup-enriquecida")
+@app.post("/api/setup_enriquecida")
 def setup_enriquecida():
     """
     Cria/atualiza a view pedidos_enriquecida (base final cruzada).
@@ -397,6 +398,7 @@ def setup_enriquecida():
 # ENDPOINTS
 # ──────────────────────────────────────────────────────────────
 @app.post("/upload")
+@app.post("/api/upload")  # mesma rota para Vercel (api/upload.py) e local
 async def upload_files(
     files: list[UploadFile] = File(...),
     replace_pedidos: bool = Form(False),
@@ -435,6 +437,7 @@ async def upload_files(
 
 
 @app.get("/health")
+@app.get("/api/health")
 def health():
     try:
         conn = get_conn()

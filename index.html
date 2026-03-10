@@ -160,11 +160,25 @@
   <!-- LISTA DE ARQUIVOS -->
   <div id="file-list" class="z1 scroll w-full max-w-3xl flex flex-col gap-2 mb-5"></div>
 
+  <!-- OPÇÃO: TROCA DIÁRIA DE PEDIDOS -->
+  <div class="z1 w-full max-w-3xl mb-3 flex items-center gap-2">
+    <input type="checkbox" id="replace-pedidos" class="rounded border" style="border-color:var(--border);accent-color:var(--accent)" />
+    <label for="replace-pedidos" class="text-sm" style="color:var(--text)">Substituir pedidos (troca diária)</label>
+  </div>
+
   <!-- BOTÃO -->
   <div class="z1 w-full max-w-3xl mb-6">
     <button id="upload-btn" class="btn-primary" disabled onclick="startUpload()">
       ⚡ Enviar para Supabase
     </button>
+  </div>
+
+  <!-- BASE ENRIQUECIDA -->
+  <div class="z1 w-full max-w-3xl mb-6 p-4 rounded-xl border" style="background:var(--panel);border-color:var(--border)">
+    <p class="mono text-xs uppercase tracking-widest mb-2" style="color:var(--muted)">Base enriquecida</p>
+    <p class="text-sm mb-3" style="color:var(--text)">Depois de subir as bases: crie a view que cruza Pedidos + Produtos + Clientes.</p>
+    <button type="button" onclick="setupEnriquecida()" class="px-4 py-2 rounded-lg text-sm font-medium border transition" style="border-color:var(--accent);color:var(--accent);background:rgba(62,207,142,.08)" onmouseover="this.style.background='rgba(62,207,142,.15)'" onmouseout="this.style.background='rgba(62,207,142,.08)'">Criar view pedidos_enriquecida</button>
+    <span id="enriquecida-msg" class="ml-2 text-sm"></span>
   </div>
 
   <!-- PROGRESSO -->
@@ -301,16 +315,18 @@ async function startUpload() {
   label.textContent = `Enviando… (comprimido ${reduction}% menor)`;
   setProgress(30);
 
-  // 2. Enviar em lotes de 10 arquivos para não estourar o limite da Vercel
+  // 2. Enviar em lotes de 10 (rota nativa da Vercel = /api/upload)
   const BATCH = 10;
   const allResults = [];
-  const url = window.location.origin + '/upload';
+  const url = window.location.origin + '/api/upload';
+  const replacePedidos = document.getElementById('replace-pedidos').checked;
 
   try {
     for (let i = 0; i < compressed.length; i += BATCH) {
       const batch = compressed.slice(i, i + BATCH);
       const form  = new FormData();
       for (const f of batch) form.append('files', f);
+      form.append('replace_pedidos', (i === 0 && replacePedidos) ? 'true' : 'false');
 
       label.textContent = `Enviando lote ${Math.floor(i/BATCH)+1} de ${Math.ceil(compressed.length/BATCH)}… (comprimido ${reduction}% menor)`;
       setProgress(30 + Math.round((i / compressed.length) * 60));
@@ -342,6 +358,26 @@ async function startUpload() {
 function setProgress(p) {
   document.getElementById('prog-fill').style.width = p + '%';
   document.getElementById('prog-pct').textContent  = p + '%';
+}
+
+async function setupEnriquecida() {
+  const el = document.getElementById('enriquecida-msg');
+  el.textContent = '…';
+  el.style.color = 'var(--muted)';
+  try {
+    const res = await fetch(window.location.origin + '/api/setup_enriquecida', { method: 'POST' });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      el.textContent = '✓ ' + (data.message || 'View criada.');
+      el.style.color = 'var(--accent)';
+    } else {
+      el.textContent = '✗ ' + (data.message || 'Erro');
+      el.style.color = 'var(--red)';
+    }
+  } catch (err) {
+    el.textContent = '✗ ' + err.message;
+    el.style.color = 'var(--red)';
+  }
 }
 
 function showResults(data) {
