@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 python-multipart
 pandas
+pyarrow
 openpyxl
 python-dotenv
 google-cloud-bigquery

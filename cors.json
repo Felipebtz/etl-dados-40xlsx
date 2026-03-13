@@ -1,0 +1,8 @@
+[
+    {
+      "origin": ["http://127.0.0.1:8000", "http://localhost:8000", "https://etl-dados-40xlsx-production.up.railway.app"],
+      "method": ["PUT", "OPTIONS", "GET", "HEAD"],
+      "responseHeader": ["Content-Type", "Content-Length", "x-goog-resumable", "x-goog-meta-*"],
+      "maxAgeSeconds": 3600
+    }
+  ]

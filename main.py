@@ -1,16 +1,19 @@
 """
 GCP Bulk Uploader
-Recebe ZIP via Cloud Storage, processa XLSX/CSV em chunks e carrega no BigQuery.
-Detecta automaticamente o tipo de arquivo (pedidos / produtos / clientes).
+Principal: carregamento de CSV do GCS (stream + load job Parquet) — rápido, suporta milhões de linhas.
+Também: ZIP com XLSX/CSV. Detecção automática (pedidos / produtos / clientes).
+Objetivo final: view unificada (enriquecimento) para uso em uma única plataforma.
 """
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
+import csv
 import gzip
 import io
 import json
+import logging
 import os
 import re
 import tempfile
@@ -18,8 +21,16 @@ import time
 import traceback
 import uuid
 import zipfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -42,12 +53,33 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # GCP_DATASET              → nome do dataset BigQuery (ex: etl_dados)
 
 def _get_gcp_credentials():
-    """Carrega credenciais da variável de ambiente GCP_SERVICE_ACCOUNT_JSON."""
+    """
+    Carrega credenciais GCP de uma destas formas:
+    1) GOOGLE_APPLICATION_CREDENTIALS = caminho do arquivo .json (ex.: springboot-demo-484902-6d1ccdd455a6.json)
+    2) GCP_SERVICE_ACCOUNT_JSON = conteúdo do JSON colado (para Railway)
+    """
+    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if path:
+        # Caminho relativo à pasta do projeto
+        if not os.path.isabs(path):
+            path = str(Path(__file__).resolve().parent / path)
+        if os.path.isfile(path):
+            return service_account.Credentials.from_service_account_file(
+                path,
+                scopes=[
+                    "https://www.googleapis.com/auth/cloud-platform",
+                    "https://www.googleapis.com/auth/bigquery",
+                ],
+            )
     raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "")
     if not raw:
         raise RuntimeError(
-            "GCP_SERVICE_ACCOUNT_JSON não configurada! "
-            "Railway → Variables → adicione o conteúdo do JSON da service account."
+            "Credenciais GCP não encontradas. Crie um arquivo .env na pasta do projeto com:\n"
+            "  GCP_PROJECT_ID=springboot-demo-484902\n"
+            "  GCP_BUCKET=el-lucas\n"
+            "  GCP_DATASET=dataset_lucas\n"
+            "  GOOGLE_APPLICATION_CREDENTIALS=springboot-demo-484902-6d1ccdd455a6.json\n"
+            "E coloque o arquivo .json da service account na mesma pasta do main.py."
         )
     info = json.loads(raw)
     return service_account.Credentials.from_service_account_info(
@@ -65,7 +97,10 @@ CONFIG = {
     "chunk_size": int(os.getenv("CHUNK_SIZE", "1000")),
 }
 
-ROWS_PER_BATCH = int(os.getenv("ROWS_PER_BATCH", "50000"))
+# Tamanho do lote para CSV (principal fluxo). 100k–200k = menos load jobs, carga mais rápida. Ajuste via ROWS_PER_BATCH.
+ROWS_PER_BATCH = int(os.getenv("ROWS_PER_BATCH", "100000"))
+# Número de arquivos processados em paralelo no ZIP (1 = sequencial; 2–4 para muitos arquivos)
+PARALLEL_WORKERS = max(1, min(int(os.getenv("PARALLEL_WORKERS", "2")), 8))
 
 CSV_ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1", "iso-8859-1")
 CSV_SEPARATORS = (",", ";", "\t", "|")
@@ -74,6 +109,22 @@ CSV_SEPARATORS = (",", ";", "\t", "|")
 # SCHEMAS — mapeamento para tipos BigQuery
 # ──────────────────────────────────────────────────────────────
 # BigQuery types: STRING, INT64, FLOAT64, NUMERIC, BOOL, DATE, TIMESTAMP
+#
+# Erros de schema no load job (Parquet → BQ) e como evitamos:
+# - _loaded_at TIMESTAMP vs STRING: align_df usa pd.Timestamp.now(tz="UTC"), não .isoformat().
+# - cod_pedido / INT64 vs STRING: _coerce_col_for_parquet(..., "INT64") converte para Int64.
+# - Colunas DATE: _coerce_col_for_parquet usa .dt.date para Parquet gravar date32 (BQ DATE).
+# - Colunas BOOL: _coerce_col_for_parquet normaliza para boolean (evita STRING no Parquet).
+# - INT64/FLOAT64/NUMERIC: _coerce_col_for_parquet converte para tipo numérico.
+# - df.where(pd.notnull(df), None) só em colunas object; senão Int64/boolean viram object e Parquet grava STRING.
+# - Tabela "generico": ensure_bq_table garante _source_file e _loaded_at no schema.
+# - Particionamento: tabela exige _loaded_at no schema; ensure_bq_table adiciona se faltar.
+# - NUMERIC no Parquet: pandas/pyarrow grava como float64; BQ rejeita "changed type from NUMERIC to FLOAT".
+#   Por isso usamos FLOAT64 no schema para valores monetários; tabelas já criadas com NUMERIC precisam
+#   ALTER COLUMN ... SET DATA TYPE FLOAT64 ou DROP + recriar.
+# - Colunas STRING: align_df aplica .apply(str) + .astype("string") para o Parquet gravar string; sem isso,
+#   valores só numéricos (ex.: código "1234") seriam inferidos como INT64 → schema mismatch no load job.
+# - Escrita no BQ: único caminho é bq_insert_batch (Parquet + load_table_from_file); insert_rows_json não é usado.
 BQ_TYPE_MAP = {
     "TEXT":        "STRING",
     "BIGINT":      "INT64",
@@ -91,8 +142,8 @@ SCHEMAS = {
             ("id_cliente",                    "INT64"),
             ("single_id",                     "STRING"),
             ("sku",                           "INT64"),
-            ("valor_item_pedido",             "NUMERIC"),
-            ("valor_item_pedido_frete",       "NUMERIC"),
+            ("valor_item_pedido",             "FLOAT64"),
+            ("valor_item_pedido_frete",       "FLOAT64"),
             ("qtd_itens",                     "INT64"),
             ("canal_venda",                   "STRING"),
             ("bandeira",                      "STRING"),
@@ -100,9 +151,9 @@ SCHEMAS = {
             ("cod_tip_frete",                 "INT64"),
             ("descricao_tipo_frete",          "STRING"),
             ("data_atualizacao",              "DATE"),
-            ("valor_frete",                   "NUMERIC"),
+            ("valor_frete",                   "FLOAT64"),
             ("flag_retira",                   "BOOL"),
-            ("data_entrega",                  "STRING"),
+            ("data_entrega",                  "TIMESTAMP"),
             ("flag_marketplace",              "BOOL"),
             ("flag_lista_casamento",          "BOOL"),
             ("id_lista_casamento",            "INT64"),
@@ -180,13 +231,56 @@ def detect_table(df_columns: list[str]) -> str:
     return best if scores[best] >= 0.4 else "generico"
 
 def _clean_chunk(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.loc[:, ~df.columns.str.match(r"^Unnamed:\s*\d+$", na=False)]
+    """Remove colunas Unnamed (linhas com 'too many values') e normaliza nulos."""
+    unnamed = df.columns.str.match(r"^Unnamed:\s*\d+$", na=False)
+    if unnamed.any():
+        df = df.loc[:, ~unnamed]
     return df.replace({"": None, "nan": None, "NaN": None, "None": None, "NULL": None})
+
+def _coerce_col_for_parquet(series: pd.Series, bq_type: str, col_name: str = None) -> pd.Series:
+    """Converte coluna para tipo compatível com Parquet/BigQuery e evita schema mismatch no load job.
+    Loga quando valores viram NaN após coerção (ex.: vírgula decimal, texto inválido)."""
+    col_label = col_name or "?"
+    if bq_type == "TIMESTAMP":
+        out = pd.to_datetime(series, utc=True, errors="coerce")
+        _log_coerce_nans(series, out, col_label, "TIMESTAMP")
+        return out
+    if bq_type == "DATE":
+        out = pd.to_datetime(series, errors="coerce").dt.date
+        _log_coerce_nans(series, out, col_label, "DATE")
+        return out
+    if bq_type == "BOOL":
+        if series.dtype == bool or series.dtype.name == "boolean":
+            return series
+        s = series.astype(str).str.lower().str.strip()
+        out = s.isin(("1", "true", "sim", "yes", "s")).where(series.notna(), pd.NA).astype("boolean")
+        return out
+    if bq_type == "INT64":
+        out = pd.to_numeric(series, errors="coerce").astype("Int64")
+        _log_coerce_nans(series, out, col_label, "INT64")
+        return out
+    if bq_type in ("FLOAT64", "NUMERIC"):
+        out = pd.to_numeric(series, errors="coerce")
+        _log_coerce_nans(series, out, col_label, bq_type)
+        return out
+    return series
+
+
+def _log_coerce_nans(before: pd.Series, after: pd.Series, col_name: str, bq_type: str) -> None:
+    """Se a coerção introduziu novos nulls (ex.: '1.831,23' → NaN), loga aviso."""
+    before_ok = before.notna() & (before.astype(str).str.strip() != "")
+    after_ok = after.notna()
+    new_nans = before_ok & ~after_ok
+    n = new_nans.sum()
+    if n > 0:
+        log.warning("Coerção %s (%s): %s valor(es) viraram null (ex.: vírgula decimal ou inválido)", col_name, bq_type, n)
+
 
 def align_df(df: pd.DataFrame, table: str, source_file: str) -> pd.DataFrame:
     df.columns = [sanitize_col(c) for c in df.columns]
     df["_source_file"] = source_file
-    df["_loaded_at"]   = datetime.now(timezone.utc).isoformat()
+    # TIMESTAMP para Parquet/BQ: tipo nativo evita erro "Field _loaded_at has changed type from TIMESTAMP to STRING"
+    df["_loaded_at"] = pd.Timestamp.now(tz="UTC")
 
     schema = SCHEMAS.get(table)
     if not schema:
@@ -200,7 +294,23 @@ def align_df(df: pd.DataFrame, table: str, source_file: str) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = None
     df = df[canonical_cols]
-    return df.where(pd.notnull(df), None)
+
+    # Coerção de tipos para evitar schema mismatch no load job (Parquet → BigQuery)
+    for col, bq_type in schema["columns"]:
+        if col not in df.columns:
+            continue
+        if bq_type in ("TIMESTAMP", "DATE", "BOOL", "INT64", "FLOAT64", "NUMERIC"):
+            df[col] = _coerce_col_for_parquet(df[col], bq_type, col_name=col)
+        elif bq_type == "STRING":
+            # Garante STRING no Parquet (evita "Field X has changed type from STRING to INTEGER" quando valores são numéricos)
+            s = df[col].apply(lambda x: None if pd.isna(x) or x is None else str(x))
+            df[col] = s.astype("string")  # StringDtype → Parquet grava como string, não infere int
+
+    # Só substituir null por None em colunas object (vetorial); evita Int64/boolean virarem object.
+    obj_cols = [c for c in df.columns if df[c].dtype == object]
+    if obj_cols:
+        df[obj_cols] = df[obj_cols].where(pd.notnull(df[obj_cols]), None)
+    return df
 
 # ──────────────────────────────────────────────────────────────
 # BIGQUERY — criar tabela + inserir em lotes
@@ -210,12 +320,20 @@ def get_bq_client():
     return bigquery.Client(project=CONFIG["project_id"], credentials=creds)
 
 def ensure_bq_table(bq: bigquery.Client, table_id: str, schema_def: list[tuple]):
-    """Cria a tabela no BigQuery se não existir."""
+    """Cria a tabela no BigQuery se não existir. Garante _source_file e _loaded_at no schema (exigido pelo particionamento).
+    Se a tabela já existir com colunas NUMERIC (ex.: valor_item_pedido), altere para FLOAT64 no BQ ou apague a tabela e deixe recriar."""
     full_id = f"{CONFIG['project_id']}.{CONFIG['dataset']}.{table_id}"
+    schema_def = list(schema_def)
+    cols = {col for col, _ in schema_def}
+    if "_source_file" not in cols:
+        schema_def.append(("_source_file", "STRING"))
+    if "_loaded_at" not in cols:
+        schema_def.append(("_loaded_at", "TIMESTAMP"))
     schema  = [bigquery.SchemaField(col, typ) for col, typ in schema_def]
     table   = bigquery.Table(full_id, schema=schema)
     table.time_partitioning = bigquery.TimePartitioning(field="_loaded_at")
     bq.create_table(table, exists_ok=True)
+    log.info("BigQuery: tabela criada/verificada %s (%s colunas)", full_id, len(schema))
     return full_id
 
 def ensure_bq_dataset(bq: bigquery.Client):
@@ -226,17 +344,192 @@ def ensure_bq_dataset(bq: bigquery.Client):
     bq.create_dataset(dataset, exists_ok=True)
 
 def bq_insert_batch(bq: bigquery.Client, full_table_id: str, df: pd.DataFrame):
-    """Insere um DataFrame no BigQuery via streaming insert (rows_to_insert)."""
-    chunk_size = CONFIG["chunk_size"]
-    errors_all = []
-    for i in range(0, len(df), chunk_size):
-        chunk  = df.iloc[i: i + chunk_size]
-        rows   = chunk.to_dict(orient="records")
-        errors = bq.insert_rows_json(full_table_id, rows)
-        if errors:
-            errors_all.extend(errors)
-    if errors_all:
-        raise RuntimeError(f"BigQuery insert errors: {errors_all[:3]}")
+    """
+    Insere um DataFrame no BigQuery via load job (Parquet).
+    Evita pico de RAM de insert_rows_json e escala para milhões de linhas.
+    Fluxo: DataFrame → arquivo Parquet temporário → load_table_from_file → WRITE_APPEND.
+    """
+    if df.empty:
+        return
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
+        os.close(fd)
+        # Garante tipos compatíveis: colunas object com apenas date() viram date32 no Parquet
+        df.to_parquet(tmp_path, index=False)
+        job_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        with open(tmp_path, "rb") as f:
+            load_job = bq.load_table_from_file(f, full_table_id, job_config=job_config)
+        load_job.result()
+        log.info(
+            "BigQuery: inseridas %s linhas em %s via load job (Parquet)",
+            len(df),
+            full_table_id.split(".")[-1],
+        )
+    except Exception as e:
+        log.exception(
+            "BigQuery load job falhou para %s (%s linhas). Dtypes: %s",
+            full_table_id.split(".")[-1],
+            len(df),
+            df.dtypes.to_dict(),
+        )
+        raise
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+# ──────────────────────────────────────────────────────────────
+# PIPELINE CSV (PRINCIPAL) — stream, limpeza, load job Parquet, enriquecimento no final
+# Fluxo: CSV no GCS → stream (sem carregar tudo na RAM) → lotes → Parquet → BigQuery.
+# Objetivo: carregamento rápido e estável de milhões de linhas; enriquecimento via view unificada.
+# ──────────────────────────────────────────────────────────────
+def _read_lines_from_stream(stream, chunk_size: int = 2**20) -> iter:
+    """Lê stream binário em chunks, remove \\x00, entrega linha a linha — SEM acumular o arquivo na RAM."""
+    buffer = b""
+    for chunk in iter(lambda: stream.read(chunk_size), b""):
+        buffer += chunk.replace(b"\x00", b"")
+        parts = buffer.split(b"\n")
+        buffer = parts.pop()
+        for line in parts:
+            line = line.rstrip(b"\r")
+            if line:
+                yield line
+    if buffer.strip():
+        yield buffer.strip()
+
+def _detect_sep_from_header(line: bytes, encodings: tuple = CSV_ENCODINGS) -> tuple[str, str]:
+    """Detecta encoding e separador usando csv.reader; escolhe o sep que produz mais colunas (evita vírgula dentro de campo)."""
+    best_enc, best_sep = "utf-8", ","
+    best_cols = 0
+    for enc in encodings:
+        try:
+            text = line.decode(enc)
+            for sep in CSV_SEPARATORS:
+                row = next(csv.reader(io.StringIO(text), delimiter=sep))
+                if len(row) >= 2 and len(row) > best_cols:
+                    best_enc, best_sep, best_cols = enc, sep, len(row)
+        except Exception:
+            continue
+    return (best_enc, best_sep) if best_cols >= 2 else ("utf-8", ",")
+
+def stream_clean_csv(stream, batch_size: int = None) -> iter:
+    """
+    Lê CSV do stream linha a linha: remove ASCII 0, valida número de colunas,
+    descarta linhas irrecuperáveis. Entrega (header, list_of_rows) em lotes.
+    Usa csv.reader para respeitar campos entre aspas. Conta e loga linhas descartadas.
+    """
+    batch_size = batch_size or ROWS_PER_BATCH
+    lines = _read_lines_from_stream(stream)
+    header_line = next(lines, None)
+    if not header_line:
+        return
+    enc, sep = _detect_sep_from_header(header_line)
+    text = header_line.decode(enc, errors="replace")
+    header = next(csv.reader(io.StringIO(text), delimiter=sep))
+    header = [sanitize_col(h) for h in header]
+    n_expected = len(header)
+    batch = []
+    bad_lines = 0
+    for line in lines:
+        try:
+            text = line.decode(enc, errors="replace")
+            row = next(csv.reader(io.StringIO(text), delimiter=sep))
+            if len(row) != n_expected:
+                bad_lines += 1
+                continue
+            batch.append(row)
+            if len(batch) >= batch_size:
+                if bad_lines > 0:
+                    log.warning("CSV: %s linhas descartadas (colunas != %s) neste lote", bad_lines, n_expected)
+                bad_lines = 0
+                yield header, batch
+                batch = []
+        except Exception:
+            bad_lines += 1
+            continue
+    if bad_lines > 0:
+        log.warning("CSV: %s linhas descartadas (colunas != %s) no lote final", bad_lines, n_expected)
+    if batch:
+        yield header, batch
+
+
+def _stream_csv_to_bq(
+    stream,
+    filename: str,
+    bq: bigquery.Client,
+    replace_pedidos: bool,
+    table_type_hint: str = "generico",
+) -> tuple[int, str]:
+    """
+    Pipeline CSV: stream → stream_clean_csv → lotes → load job Parquet no BigQuery.
+    Usado por load-from-gcs (principal) e por CSV dentro do ZIP. Suporta milhões de linhas.
+    Retorna (total_rows, table_name).
+    """
+    log.info("CSV stream: iniciando leitura e carga para %s", filename)
+    ensure_bq_dataset(bq)
+    full_table_id = None
+    table = table_type_hint if table_type_hint in ("pedidos", "produtos", "clientes") else "generico"
+    total_rows = 0
+    batch_num = 0
+    if replace_pedidos and table == "pedidos":
+        full_id = f"{CONFIG['project_id']}.{CONFIG['dataset']}.pedidos"
+        try:
+            bq.delete_table(full_id)
+            log.info("CSV stream: tabela pedidos truncada (replace_pedidos)")
+        except Exception:
+            pass
+
+    for header, rows in stream_clean_csv(stream):
+        if not rows:
+            continue
+        df = pd.DataFrame(rows, columns=header, dtype=str)
+        df = _clean_chunk(df).dropna(how="all")
+        if df.empty:
+            continue
+        if full_table_id is None:
+            table = detect_table(list(df.columns))
+            schema_def = SCHEMAS.get(table, {}).get("columns") or [
+                (sanitize_col(c), "STRING") for c in df.columns
+            ]
+            full_table_id = ensure_bq_table(bq, table, schema_def)
+            log.info("CSV stream: tipo detectado=%s, tabela=%s", table, full_table_id.split(".")[-1])
+        df = align_df(df, table, filename)
+        bq_insert_batch(bq, full_table_id, df)
+        total_rows += len(df)
+        batch_num += 1
+        log.info("CSV stream: %s — lote %s: +%s linhas (total %s)", filename, batch_num, len(df), total_rows)
+    log.info("CSV stream: concluído %s — tabela=%s, total=%s linhas", filename, table or "generico", total_rows)
+    log.info("CSV: próximo passo → POST /setup-enriquecida para criar a view unificada (pedidos + produtos + clientes)")
+    return total_rows, table or "generico"
+
+
+def stream_from_gcs_clean_and_load(
+    bucket_name: str,
+    path: str,
+    filename: str,
+    table_type: str,
+    bq: bigquery.Client,
+    replace_pedidos: bool,
+) -> tuple[int, str]:
+    """
+    CSV no GCS: stream (sem carregar arquivo inteiro) → limpeza → lotes Parquet → load job BQ.
+    Fluxo principal para carregamento rápido de CSVs grandes (milhões de linhas).
+    Retorna (total_rows, table_name) onde table_name é o tipo detectado (pedidos/produtos/clientes/generico).
+    """
+    log.info("GCS CSV: abrindo stream %s/%s para %s", bucket_name, path, filename)
+    gcs    = get_gcs_client()
+    bucket = gcs.bucket(bucket_name)
+    blob   = bucket.blob(path)
+    with blob.open("rb") as stream:
+        total_rows, table = _stream_csv_to_bq(stream, filename, bq, replace_pedidos, table_type)
+    log.info("GCS CSV: carga finalizada %s — %s linhas (use /setup-enriquecida para view unificada)", filename, total_rows)
+    return total_rows, table
 
 # ──────────────────────────────────────────────────────────────
 # STREAMING CSV — lê em chunks sem carregar tudo na RAM
@@ -255,13 +548,18 @@ def _detect_csv_params(raw_content: bytes) -> tuple[str, str]:
     raise ValueError("Não foi possível detectar encoding/separador do CSV.")
 
 def stream_csv(raw_content: bytes, filename: str, bq_client: bigquery.Client) -> tuple[str, int]:
-    enc, sep = _detect_csv_params(raw_content)
-    reader   = pd.read_csv(io.BytesIO(raw_content), sep=sep, encoding=enc,
-                           on_bad_lines="skip", dtype=str, keep_default_na=False,
-                           chunksize=ROWS_PER_BATCH)
+    size_mb = len(raw_content) / 1024 / 1024
+    log.info("CSV (memória): iniciando %s (%.1f MB), lote=%s", filename, size_mb, ROWS_PER_BATCH)
+    raw_clean = raw_content.replace(b"\x00", b"")
+    enc, sep  = _detect_csv_params(raw_clean)
+    log.info("CSV (memória): encoding=%s, sep=%r", enc, sep)
+    reader    = pd.read_csv(io.BytesIO(raw_clean), sep=sep, encoding=enc,
+                            on_bad_lines="skip", dtype=str, keep_default_na=False,
+                            chunksize=ROWS_PER_BATCH)
     table       = None
     total_rows  = 0
     full_tbl_id = None
+    batch_num   = 0
 
     for batch in reader:
         batch = _clean_chunk(batch).dropna(how="all")
@@ -272,12 +570,16 @@ def stream_csv(raw_content: bytes, filename: str, bq_client: bigquery.Client) ->
             schema_def = SCHEMAS.get(table, {}).get("columns") or \
                          [(sanitize_col(c), "STRING") for c in batch.columns]
             full_tbl_id = ensure_bq_table(bq_client, table, schema_def)
+            log.info("CSV (memória): tipo detectado=%s", table)
 
         batch = align_df(batch, table, filename)
         bq_insert_batch(bq_client, full_tbl_id, batch)
         total_rows += len(batch)
+        batch_num += 1
+        log.info("CSV (memória): %s — lote %s: +%s linhas (total %s)", filename, batch_num, len(batch), total_rows)
         del batch
 
+    log.info("CSV (memória): concluído %s — tabela=%s, total=%s linhas", filename, table or "generico", total_rows)
     return table or "generico", total_rows
 
 # ──────────────────────────────────────────────────────────────
@@ -285,17 +587,21 @@ def stream_csv(raw_content: bytes, filename: str, bq_client: bigquery.Client) ->
 # ──────────────────────────────────────────────────────────────
 def stream_xlsx(raw_content: bytes, filename: str, bq_client: bigquery.Client) -> tuple[str, int]:
     import openpyxl
+    size_mb = len(raw_content) / 1024 / 1024
+    log.info("XLSX: abrindo workbook %s (%.1f MB)...", filename, size_mb)
     wb = openpyxl.load_workbook(io.BytesIO(raw_content), read_only=True, data_only=True)
     ws = wb.active
+    log.info("XLSX: workbook aberto, planilha ativa=%s. Iniciando leitura linha a linha (lote=%s)...", ws.title, ROWS_PER_BATCH)
 
     table       = None
     total_rows  = 0
     full_tbl_id = None
     headers     = None
     batch_rows  = []
+    batch_num   = 0
 
     def flush(rows):
-        nonlocal table, full_tbl_id, total_rows
+        nonlocal table, full_tbl_id, total_rows, batch_num
         df = pd.DataFrame(rows, columns=headers, dtype=str)
         df = _clean_chunk(df).dropna(how="all")
         if df.empty:
@@ -307,15 +613,19 @@ def stream_xlsx(raw_content: bytes, filename: str, bq_client: bigquery.Client) -
             schema_def  = SCHEMAS.get(table, {}).get("columns") or \
                           [(sanitize_col(c), "STRING") for c in df.columns]
             full_tbl_id = ensure_bq_table(bq_client, table, schema_def)
+            log.info("XLSX: tipo detectado=%s, tabela=%s", table, full_tbl_id.split(".")[-1])
 
         df = align_df(df, table, filename)
         bq_insert_batch(bq_client, full_tbl_id, df)
         total_rows += len(df)
+        batch_num += 1
+        log.info("XLSX: %s — lote %s inserido: +%s linhas (total %s)", filename, batch_num, len(df), total_rows)
         del df
 
     for i, row in enumerate(ws.iter_rows(values_only=True)):
         if i == 0:
             headers = [str(c) if c is not None else f"col_{j}" for j, c in enumerate(row)]
+            log.info("XLSX: %s — cabeçalho com %s colunas", filename, len(headers))
             continue
         batch_rows.append([str(v) if v is not None else None for v in row])
         if len(batch_rows) >= ROWS_PER_BATCH:
@@ -326,6 +636,7 @@ def stream_xlsx(raw_content: bytes, filename: str, bq_client: bigquery.Client) -
         flush(batch_rows)
 
     wb.close()
+    log.info("XLSX: concluído %s — tabela=%s, total=%s linhas", filename, table or "generico", total_rows)
     return table or "generico", total_rows
 
 # ──────────────────────────────────────────────────────────────
@@ -333,11 +644,14 @@ def stream_xlsx(raw_content: bytes, filename: str, bq_client: bigquery.Client) -
 # ──────────────────────────────────────────────────────────────
 def process_file(filename: str, content: bytes) -> dict:
     start  = time.time()
+    size_mb = len(content) / 1024 / 1024
+    log.info("process_file: iniciando %s (%.1f MB)", filename, size_mb)
     result = {"file": filename, "status": "ok", "rows": 0, "table": "", "elapsed_s": 0, "error": None}
     try:
         real_filename = filename
         raw_content   = content
         if filename.lower().endswith(".gz"):
+            log.info("process_file: descomprimindo .gz...")
             raw_content   = gzip.decompress(content)
             real_filename = filename[:-3]
             result["file"] = real_filename
@@ -345,7 +659,7 @@ def process_file(filename: str, content: bytes) -> dict:
         bq = get_bq_client()
         ensure_bq_dataset(bq)
 
-        if real_filename.lower().endswith(".csv"):
+        if real_filename.lower().endswith((".csv", ".txt")):
             table, rows = stream_csv(raw_content, real_filename, bq)
         else:
             table, rows = stream_xlsx(raw_content, real_filename, bq)
@@ -353,12 +667,15 @@ def process_file(filename: str, content: bytes) -> dict:
         result["table"] = table
         result["rows"]  = rows
         del raw_content
+        result["elapsed_s"] = round(time.time() - start, 2)
+        log.info("process_file: concluído %s — tabela=%s, %s linhas em %.1fs", filename, result["table"], result["rows"], result["elapsed_s"])
 
     except Exception:
         result["status"] = "error"
         result["error"]  = traceback.format_exc()
+        result["elapsed_s"] = round(time.time() - start, 2)
+        log.exception("process_file: ERRO em %s após %.1fs", filename, result["elapsed_s"])
 
-    result["elapsed_s"] = round(time.time() - start, 2)
     return result
 
 # ──────────────────────────────────────────────────────────────
@@ -378,76 +695,192 @@ async def storage_token(body: dict):
     Gera signed URL para o browser fazer upload direto no GCS.
     Se unique=True (ou para arquivos soltos), usa path único: uploads/YYYY-MM-DD/{uuid}_{filename}.
     """
-    filename = body.get("filename", "upload.zip")
-    unique   = body.get("unique", False)
-    safe     = re.sub(r"[^a-zA-Z0-9._-]", "_", filename)
-    if unique:
-        path = f"uploads/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4().hex}_{safe}"
-    else:
-        path = f"uploads/{safe}"
-    gcs   = get_gcs_client()
-    bucket = gcs.bucket(CONFIG["bucket"])
-    blob  = bucket.blob(path)
-    signed_url = blob.generate_signed_url(
-        version      = "v4",
-        expiration   = 3600,
-        method       = "PUT",
-        content_type = body.get("content_type") or "application/octet-stream",
-    )
-    return {"upload_url": signed_url, "path": path}
+    try:
+        filename = body.get("filename", "upload.zip")
+        unique   = body.get("unique", False)
+        safe     = re.sub(r"[^a-zA-Z0-9._-]", "_", filename)
+        if unique:
+            path = f"uploads/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4().hex}_{safe}"
+        else:
+            path = f"uploads/{safe}"
+        gcs   = get_gcs_client()
+        bucket = gcs.bucket(CONFIG["bucket"])
+        blob  = bucket.blob(path)
+        signed_url = blob.generate_signed_url(
+            version      = "v4",
+            expiration   = 3600,
+            method       = "PUT",
+            content_type = body.get("content_type") or "application/octet-stream",
+        )
+        return {"upload_url": signed_url, "path": path}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+def _zip_aceita(n: str) -> bool:
+    """Se o nome do entry do ZIP deve ser processado (evita __MACOSX, etc.)."""
+    n = n.replace("\\", "/")
+    base = os.path.basename(n)
+    if n.startswith("__MACOSX") or base.startswith("."):
+        return False
+    low = base.lower()
+    if low.endswith((".xlsx", ".xls", ".csv", ".txt", ".csv.gz", ".txt.gz")):
+        return True
+    if ".csv" in low or ".xlsx" in low or ".xls" in low:
+        return True
+    return False
+
+
+def _zip_is_streamable_csv(name: str) -> bool:
+    """Se o entry é CSV/txt (incl. .gz) e pode ser lido em stream."""
+    low = os.path.basename(name).lower()
+    if low.endswith(".gz"):
+        low = low[:-3]
+    return low.endswith(".csv") or low.endswith(".txt")
+
+
+def _process_one_zip_entry(args: tuple) -> tuple[int, dict]:
+    """
+    Processa um único arquivo dentro do ZIP. Usado por ProcessPoolExecutor.
+    Retorna (índice_original, result_dict).
+    """
+    tmp_path, idx, name = args
+    start = time.time()
+    filename = os.path.basename(name)
+    try:
+        with zipfile.ZipFile(tmp_path, "r") as zf:
+            if _zip_is_streamable_csv(name):
+                display_name = filename[:-3] if filename.lower().endswith(".gz") else filename
+                bq = get_bq_client()
+                # replace_pedidos já foi aplicado no início de process_storage (truncate pedidos); workers só fazem append.
+                if filename.lower().endswith(".gz"):
+                    with zf.open(name) as raw:
+                        with gzip.GzipFile(fileobj=raw) as stream:
+                            total_rows, table = _stream_csv_to_bq(stream, display_name, bq, False)
+                else:
+                    with zf.open(name) as stream:
+                        total_rows, table = _stream_csv_to_bq(stream, display_name, bq, False)
+                elapsed = round(time.time() - start, 2)
+                return (idx, {
+                    "file": display_name,
+                    "status": "ok",
+                    "rows": total_rows,
+                    "table": table,
+                    "elapsed_s": elapsed,
+                    "error": None,
+                })
+            else:
+                content_bytes = zf.read(name)
+                result = process_file(filename, content_bytes)
+                result["elapsed_s"] = round(time.time() - start, 2)
+                return (idx, result)
+    except Exception:
+        elapsed = round(time.time() - start, 2)
+        return (idx, {
+            "file": filename,
+            "status": "error",
+            "rows": 0,
+            "table": "",
+            "elapsed_s": elapsed,
+            "error": traceback.format_exc(),
+        })
 
 
 @app.post("/process-storage")
 async def process_storage(body: dict):
     """
     Baixa o ZIP do GCS em streaming para arquivo temporário,
-    extrai e processa cada arquivo individualmente no BigQuery.
+    extrai e processa cada arquivo no BigQuery (em paralelo quando PARALLEL_WORKERS > 1).
     """
     path            = body.get("path", "")
     replace_pedidos = body.get("replace_pedidos", False)
     if not path:
         raise HTTPException(400, "Campo 'path' obrigatório.")
 
+    log.info("process-storage: iniciando path=%s, replace_pedidos=%s", path, replace_pedidos)
     gcs    = get_gcs_client()
     bucket = gcs.bucket(CONFIG["bucket"])
     blob   = bucket.blob(path)
 
-    # Truncar pedidos antes se solicitado
     if replace_pedidos:
         bq      = get_bq_client()
         full_id = f"{CONFIG['project_id']}.{CONFIG['dataset']}.pedidos"
         try:
             bq.delete_table(full_id)
         except Exception:
-            pass  # tabela pode não existir ainda
+            pass
 
     tmp_path = None
     results  = []
     try:
-        # Download streaming para disco temporário
+        log.info("process-storage: baixando ZIP do GCS para arquivo temporário...")
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
             tmp_path = tmp.name
             blob.download_to_file(tmp)
+        log.info("process-storage: ZIP baixado em %s", tmp_path)
 
         if not zipfile.is_zipfile(tmp_path):
             raise HTTPException(400, "Arquivo no Storage não é um ZIP válido.")
 
         with zipfile.ZipFile(tmp_path) as zf:
-            names = [
-                n for n in zf.namelist()
-                if not n.startswith("__MACOSX")
-                and not os.path.basename(n).startswith(".")
-                and n.lower().endswith((".xlsx", ".xls", ".csv"))
-            ]
-            if not names:
-                raise HTTPException(400, "Nenhum XLSX/CSV encontrado no ZIP.")
+            names = [n.replace("\\", "/") for n in zf.namelist() if _zip_aceita(n)]
 
-            for name in names:
-                filename      = os.path.basename(name)
-                content_bytes = zf.read(name)
-                result        = process_file(filename, content_bytes)
-                results.append(result)
-                del content_bytes  # libera RAM
+        if not names:
+            raise HTTPException(
+                400,
+                "Nenhum arquivo .csv, .xlsx, .xls ou .txt encontrado no ZIP. "
+                "Verifique: extensão correta, arquivos na raiz ou em subpastas (todos são considerados)."
+            )
+
+        total_files = len(names)
+        workers = PARALLEL_WORKERS if total_files > 1 else 1
+        log.info("ZIP: %s arquivos a processar (workers=%s): %s", total_files, workers, [os.path.basename(n) for n in names])
+
+        if workers <= 1:
+            # Sequencial
+            bq = get_bq_client()
+            for idx, name in enumerate(names):
+                filename = os.path.basename(name)
+                start_t = time.time()
+                log.info("ZIP: [%s/%s] Processando %s", idx + 1, total_files, filename)
+                try:
+                    if _zip_is_streamable_csv(name):
+                        display_name = filename[:-3] if filename.lower().endswith(".gz") else filename
+                        # replace_pedidos já aplicado no início (truncate pedidos); aqui só append.
+                        if filename.lower().endswith(".gz"):
+                            with zipfile.ZipFile(tmp_path) as zf:
+                                with zf.open(name) as raw:
+                                    with gzip.GzipFile(fileobj=raw) as stream:
+                                        total_rows, table = _stream_csv_to_bq(stream, display_name, bq, False)
+                        else:
+                            with zipfile.ZipFile(tmp_path) as zf:
+                                with zf.open(name) as stream:
+                                    total_rows, table = _stream_csv_to_bq(stream, display_name, bq, False)
+                        elapsed = round(time.time() - start_t, 2)
+                        results.append({"file": display_name, "status": "ok", "rows": total_rows, "table": table, "elapsed_s": elapsed, "error": None})
+                    else:
+                        with zipfile.ZipFile(tmp_path) as zf:
+                            content_bytes = zf.read(name)
+                        result = process_file(filename, content_bytes)
+                        result["elapsed_s"] = round(time.time() - start_t, 2)
+                        results.append(result)
+                        del content_bytes
+                except Exception:
+                    elapsed = round(time.time() - start_t, 2)
+                    log.exception("ZIP: [%s/%s] ERRO %s", idx + 1, total_files, filename)
+                    results.append({"file": filename, "status": "error", "rows": 0, "table": "", "elapsed_s": elapsed, "error": traceback.format_exc()})
+        else:
+            # Paralelo: cada worker processa um arquivo (abre o ZIP sozinho)
+            task_args = [(tmp_path, idx, name) for idx, name in enumerate(names)]
+            results_by_idx = {}
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_process_one_zip_entry, a): a[1] for a in task_args}
+                for future in as_completed(futures):
+                    idx, result = future.result()
+                    results_by_idx[idx] = result
+                    log.info("ZIP: concluído [%s/%s] %s", idx + 1, total_files, result.get("file", ""))
+            results = [results_by_idx[i] for i in range(len(names))]
 
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -455,14 +888,16 @@ async def process_storage(body: dict):
 
     ok    = [r for r in results if r["status"] == "ok"]
     error = [r for r in results if r["status"] != "ok"]
+    log.info("process-storage: concluído path=%s — total=%s, sucesso=%s, falhas=%s", path, len(results), len(ok), len(error))
     return {"total": len(results), "success": len(ok), "failed": len(error), "results": results}
 
 
 @app.post("/load-from-gcs")
 async def load_from_gcs(body: dict):
     """
-    Carrega um arquivo CSV já no GCS direto no BigQuery (load job).
-    O Railway NÃO baixa o arquivo — evita timeout e 502 para arquivos grandes.
+    Carrega CSV do GCS (fluxo principal para grandes volumes).
+    Stream → remove ASCII 0 → valida colunas → lotes em Parquet → load job no BigQuery.
+    Rápido e com suporte a milhões de linhas. Ao final, use POST /setup-enriquecida para a view unificada.
     """
     path            = body.get("path", "").strip()
     table_type      = (body.get("table_type") or "generico").strip().lower()
@@ -471,36 +906,54 @@ async def load_from_gcs(body: dict):
         raise HTTPException(400, "Campo 'path' obrigatório.")
     if table_type not in ("pedidos", "produtos", "clientes", "generico"):
         table_type = "generico"
+    filename = path.split("/")[-1] if "/" in path else path
+    if "_" in filename and filename.count("_") >= 2:
+        filename = filename.split("_", 1)[1]
 
-    gcs_uri = f"gs://{CONFIG['bucket']}/{path}"
-    bq      = get_bq_client()
-    ensure_bq_dataset(bq)
-    table_id = f"{CONFIG['project_id']}.{CONFIG['dataset']}.{table_type}"
-
-    job_config = bigquery.LoadJobConfig(
-        source_format       = bigquery.SourceFormat.CSV,
-        autodetect          = True,
-        skip_leading_rows   = 1,
-        write_disposition   = bigquery.WriteDisposition.WRITE_TRUNCATE
-        if (table_type == "pedidos" and replace_pedidos)
-        else bigquery.WriteDisposition.WRITE_APPEND,
-    )
-    load_job = bq.load_table_from_uri(gcs_uri, table_id, job_config=job_config)
+    log.info("load-from-gcs (CSV): path=%s, filename=%s, table_type=%s", path, filename, table_type)
     try:
-        load_job.result(timeout=600)
-        rows = load_job.output_rows or 0
-        return {"status": "ok", "rows": rows, "table": table_type}
+        bq = get_bq_client()
+        total_rows, table_detected = stream_from_gcs_clean_and_load(
+            CONFIG["bucket"],
+            path,
+            filename,
+            table_type,
+            bq,
+            replace_pedidos,
+        )
+        table_res = table_detected or table_type
+        log.info("load-from-gcs: concluído path=%s — %s linhas, tabela=%s", path, total_rows, table_res)
+        return {
+            "status": "ok",
+            "rows": total_rows,
+            "table": table_res,
+            "enrichment_hint": "Após carregar pedidos, produtos e clientes, chame POST /setup-enriquecida para a view unificada (enriquecimento).",
+        }
     except Exception as e:
+        log.exception("load-from-gcs: ERRO path=%s — %s", path, e)
+        traceback.print_exc()
         return {"status": "error", "message": str(e), "table": table_type}
 
 
 @app.post("/setup-enriquecida")
 async def setup_enriquecida():
-    """Cria/atualiza view pedidos_enriquecida no BigQuery."""
+    """
+    Cria/atualiza a view unificada pedidos_enriquecida (enriquecimento).
+    Junta pedidos + produtos + clientes em uma única tabela para uso na plataforma.
+    Chamar após o carregamento dos CSVs de pedidos, produtos e clientes.
+    """
     try:
         bq  = get_bq_client()
         ds  = CONFIG["dataset"]
         pid = CONFIG["project_id"]
+        for tbl in ("pedidos", "produtos", "clientes"):
+            try:
+                bq.get_table(f"{pid}.{ds}.{tbl}")
+            except Exception:
+                return {
+                    "status": "error",
+                    "message": f"Tabela '{tbl}' não existe. Suba os CSVs de pedidos, produtos e clientes (load-from-gcs) antes de criar a view."
+                }
         sql = f"""
         CREATE OR REPLACE VIEW `{pid}.{ds}.pedidos_enriquecida` AS
         SELECT
@@ -516,7 +969,8 @@ async def setup_enriquecida():
         LEFT JOIN `{pid}.{ds}.clientes` c    ON p.single_id = c.single_id
         """
         bq.query(sql).result()
-        return {"status": "ok", "message": f"View {ds}.pedidos_enriquecida criada/atualizada."}
+        log.info("Enriquecimento: view %s.pedidos_enriquecida criada/atualizada (pedidos + produtos + clientes)", ds)
+        return {"status": "ok", "message": f"View {ds}.pedidos_enriquecida criada/atualizada. Use esta tabela unificada na plataforma."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -703,7 +1157,7 @@ _HTML = """<!DOCTYPE html>
   <!-- BOTÃO PRINCIPAL -->
   <div class="z1 w-full max-w-2xl mb-6">
     <button id="send-btn" class="btn" disabled onclick="startFullUpload()">
-      ⚡ Enviar para Supabase
+      ⚡ Enviar para BigQuery
     </button>
   </div>
 
@@ -913,7 +1367,7 @@ async function startFullUpload() {
     if (!tokenRes.ok) throw new Error('Erro ao gerar URL de upload: ' + await tokenRes.text());
     const {upload_url, path} = await tokenRes.json();
 
-    // ── ETAPA 2: Upload direto para Supabase Storage via XHR (progresso real) ──
+    // ── ETAPA 2: Upload direto para GCS via XHR (progresso real) ──
     const p1sec   = document.getElementById('prog1-sec');
     const p1label = document.getElementById('prog1-label');
     const p1fill  = document.getElementById('prog1-fill');
